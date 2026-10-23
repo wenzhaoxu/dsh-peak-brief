@@ -391,9 +391,16 @@ test('P2：status 反映真实的拦截状态与逃生窗口', async () => {
   assert.equal(blocked.gate.blocking, true)
   assert.equal(blocked.gate.code, GATE_CODE)
 
+  // 逃生窗口用 `now()` 盖章，而 status 用查询参数里的模拟时刻判断 ——
+  // 不把时钟钉到同一刻，这条用例的结果就取决于"今天跑在 09:55 之前还是之后"。
+  await call(routes, '/api/peak-brief.debug-clock', {
+    method: 'POST',
+    body: { at: `${TODAY}T10:00:00+08:00` },
+  })
   await call(routes, '/api/peak-brief.allow', { method: 'POST', body: { minutes: 5 } })
   const allowed = await statusAt(routes, `${TODAY}T10:00:00`)
   assert.equal(allowed.gate.allow.active, true)
+  await call(routes, '/api/peak-brief.debug-clock', { method: 'POST', body: { at: null } })
 
   const off = boot(peakNow({ enabled: false }))
   assert.equal((await statusAt(off.routes, `${TODAY}T10:00:00`)).enforcement, 'none')
