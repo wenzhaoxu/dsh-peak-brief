@@ -12,6 +12,7 @@ import {
   fallbackBrief,
   finishError,
   generateBrief,
+  NO_OBJECTIVE_TEXT,
   parseBrief,
   renderBriefForResume,
   truncate,
@@ -218,7 +219,7 @@ test('buildUserMessage 造出符合 Message 形状的字面量', () => {
   assert.equal(typeof message.id, 'string')
   assert.ok(message.id.length >= 8, 'id 必须是唯一标识（官方用 randomUUID）')
   assert.deepEqual(message.content, [{ type: 'text', text: 'hello' }])
-  assert.deepEqual(message.source, { kind: 'plugin', plugin: 'dsh-peak-brief' })
+  assert.deepEqual(message.source, { kind: 'plugin:dsh-peak-brief' })
   assert.notEqual(buildUserMessage('hello').id, message.id)
 })
 
@@ -318,4 +319,12 @@ test('generateBrief 失败路径一律返回 ok:false，不抛异常', async () 
 
   const noRoute = await generateBrief({ llm: fakeLlm(okChunks), route: null, system: 'S', userText: 'U' })
   assert.equal(noRoute.error.code, 'NO_ROUTE')
+})
+
+test('fallbackBrief：空会话的 objective 是占位文案（恢复侧据此不叫醒）', () => {
+  const brief = fallbackBrief({ messages: [] })
+  assert.equal(brief.objective, NO_OBJECTIVE_TEXT)
+  assert.equal(brief.resumable, true)
+  assert.equal(brief.degraded, true)
+  assert.ok(brief.notes.endsWith('\n'), brief.notes)
 })

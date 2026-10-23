@@ -8,7 +8,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -431,6 +431,9 @@ function fakeLlm(chunks) {
   }
 }
 
+/** 假会话的一条"人说过的话"——简报流程要求会话非空。 */
+const MSG = { role: 'user', content: [{ type: 'text', text: '把 P4 做完' }] }
+
 function makeAgent(sessionId, messages = []) {
   return {
     session: {
@@ -490,8 +493,9 @@ test('P3：没有活会话 / 会话不明确时明确报错，不猜', async () 
     assert.equal(none.status, 409)
     assert.equal(none.json.error, 'no_live_agent')
 
-    addAgent(listeners, makeAgent('sess-a'))
-    addAgent(listeners, makeAgent('sess-b'))
+    // 有历史才能生成简报（0 条消息的会话会在 P1 被判为「没有可交接的工作」）
+    addAgent(listeners, makeAgent('sess-a', [MSG]))
+    addAgent(listeners, makeAgent('sess-b', [MSG]))
 
     const ambiguous = await call(routes, '/api/peak-brief.brief', { method: 'POST', body: {} })
     assert.equal(ambiguous.status, 409)
@@ -536,7 +540,7 @@ test('P3：模型不可用 / 输出不可解析时降级，仍然产出可用的
 
     // 模型胡说八道 → BRIEF_UNPARSEABLE → 降级
     const garbage = boot({ brief: { dir } }, { llm: fakeLlm(textChunks('我不会做这个')) })
-    addAgent(garbage.listeners, makeAgent('sess-y'))
+    addAgent(garbage.listeners, makeAgent('sess-y', [MSG]))
     const res2 = await call(garbage.routes, '/api/peak-brief.brief', { method: 'POST', body: {} })
     assert.equal(res2.json.degraded, true)
     assert.match(res2.json.brief.notes, /BRIEF_UNPARSEABLE/)
@@ -1621,6 +1625,47 @@ test('P6：重启兜底——park 落盘的文件会被对账认领，并在谷�
     const action = resumed.json.tick.actions.find((a) => a.sessionId === 'sess-9')
     assert.equal(action.action, 'resume')
     assert.equal(action.followedUp, true, '重启丢掉的等待，要在谷期把任务接回来')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ------------------------------------------------- 2026-10-23 事故回归：空会话
+
+test('0 条消息的会话：不写简报、不烧模型、谷期不叫醒', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-brief-nowork-'))
+  try {
+    const llm = fakeLlm(textChunks(BRIEF_JSON))
+    const { routes, listeners } = boot(
+      { enabled: true, overrides: { [TODAY]: 'peak' }, peakWindows: [['09:00', '12:00']], brief: { dir } },
+      { llm },
+    )
+
+    const spy = { injected: [], followedUp: [] }
+    const empty = {
+      session: { id: 'sess-empty', deriveMessages: () => [], requestHeader: () => null },
+      inject: (m) => spy.injected.push(m),
+      followup: (m) => spy.followedUp.push(m),
+    }
+    addAgent(listeners, empty)
+
+    const lead = await tick(routes, `${TODAY}T08:50:00+08:00`)
+    const action = lead.json.tick.actions.find((a) => a.sessionId === 'sess-empty')
+    assert.equal(action.action, 'brief')
+    assert.equal(action.skipped, 'no-work', '空会话不应当被当成一次可交接的暂停')
+    assert.equal(readdirSync(dir).length, 0, '不写简报文件')
+
+    // 手动入口也应给出可解释的拒绝，而不是 500
+    const manual = await call(routes, '/api/peak-brief.brief', { method: 'POST', body: {} })
+    assert.equal(manual.status, 409)
+    assert.equal(manual.json.error, 'BRIEF_NO_WORK')
+    assert.equal(llm.calls.length, 0, '不花一次模型调用')
+
+    const off = await tick(routes, `${TODAY}T12:00:00+08:00`)
+    const offAction = off.json.tick.actions.find((a) => a.sessionId === 'sess-empty')
+    assert.equal(offAction.action, 'none', '没有周期可恢复')
+    assert.equal(spy.followedUp.length, 0, '绝不叫醒空会话')
+    assert.equal(spy.injected.length, 0)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

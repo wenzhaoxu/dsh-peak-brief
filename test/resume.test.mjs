@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   NOTICE_SUMMARY_MAX_CHARS,
+  RESUME_SKIP_NO_WORK,
   briefNoticeSummary,
   buildNoticeMessage,
   buildResumeMessage,
@@ -11,6 +12,7 @@ import {
   newCycle,
   planDisarm,
   planResume,
+  planResumeDelivery,
 } from '../lib/resume.js'
 
 const BRIEF = {
@@ -46,8 +48,7 @@ test('briefNoticeSummary 必须有界（notice 的 summary 上限 120）', () =>
 test('buildNoticeMessage 用 notice 形式，且不携带简报正文', () => {
   const message = buildNoticeMessage(BRIEF)
   assert.equal(message.role, 'user')
-  assert.equal(message.source.kind, 'plugin')
-  assert.equal(message.source.plugin, 'dsh-peak-brief')
+  assert.equal(message.source.kind, 'plugin:dsh-peak-brief')
   assert.equal(message.source.form, 'notice')
   assert.equal(message.source.summary, briefNoticeSummary(BRIEF))
   assert.equal(message.content[0].text, briefNoticeSummary(BRIEF), 'notice 只该带摘要，不带正文')
@@ -161,4 +162,28 @@ test('newCycle 的初始形状', () => {
   assert.equal(cycle.resumed, false)
   assert.equal(cycle.disarm.attempted, false)
   assert.equal(cycle.briefPath, null)
+})
+
+// ------------------------------------------------ planResumeDelivery（2026-10-23 事故回归）
+
+test('planResumeDelivery：0 条消息的会话绝不叫醒', () => {
+  const plan = planResumeDelivery({ brief: BRIEF, sessionMessageCount: 0 })
+  assert.equal(plan.deliver, false)
+  assert.equal(plan.reason, RESUME_SKIP_NO_WORK)
+})
+
+test('planResumeDelivery：有历史的会话照常恢复（降级简报也不丢工作）', () => {
+  const degraded = { ...BRIEF, degraded: true }
+  for (const count of [1, 7, 200]) {
+    assert.equal(planResumeDelivery({ brief: degraded, sessionMessageCount: count }).deliver, true)
+  }
+  assert.equal(planResumeDelivery({ brief: BRIEF, sessionMessageCount: 3 }).deliver, true)
+})
+
+test('planResumeDelivery：判不了消息数时放行（不丢工作优先）', () => {
+  for (const count of [null, undefined]) {
+    assert.equal(planResumeDelivery({ sessionMessageCount: count }).deliver, true)
+  }
+  // 降级简报 + 有历史 ⇒ 照常恢复
+  assert.equal(planResumeDelivery({ sessionMessageCount: 2 }).deliver, true)
 })
