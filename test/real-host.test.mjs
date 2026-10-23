@@ -15,14 +15,26 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import * as plugin from '../lib/index.js'
 
-const RUNTIME = process.env.DSH_RUNTIME
-  ?? 'D:/deepseekharness/actdsh-win-x64-0.1.5-rc.2/resources/dsh/runtime'
+/**
+ * 运行时位置：环境变量 → 本机常见安装 → 打包版默认路径。
+ * 之前只写死一个 Windows 路径，别的机器上这组用例从来没真正跑起来过。
+ */
+function firstExistingRuntime(candidates) {
+  const hasRuntime = (dir) => existsSync(join(dir, 'node_modules', '@deepseek-ai', 'cordis'))
+    && existsSync(join(dir, 'node_modules', '@deepseek-ai', 'dsh-llm'))
+  return candidates.find((dir) => hasRuntime(dir)) ?? candidates[0]
+}
+
+const RUNTIME = process.env.DSH_RUNTIME ?? firstExistingRuntime([
+  join(homedir(), '.npm-global', 'lib', 'node_modules', '@deepseek-ai', 'dsh'),
+  'D:/deepseekharness/actdsh-win-x64-0.1.5-rc.2/resources/dsh/runtime',
+])
 const NODE_MODULES = join(RUNTIME, 'node_modules', '@deepseek-ai')
 const CORDIS = join(NODE_MODULES, 'cordis', 'lib', 'index.js')
 const LLM = join(NODE_MODULES, 'dsh-llm', 'lib', 'index.js')
@@ -37,8 +49,15 @@ const { Context } = available ? await import(pathToFileURL(CORDIS).href) : {}
 const llmModule = available ? await import(pathToFileURL(LLM).href) : {}
 const settingsModule = settingsAvailable ? await import(pathToFileURL(SETTINGS_FILE).href) : {}
 
-/** 只实现 `stream` 的桩适配器：LlmAdapter 的其余成员都有默认实现。 */
-class StubAdapter extends llmModule.LlmAdapter {
+/**
+ * 只实现 `stream` 的桩适配器：LlmAdapter 的其余成员都有默认实现。
+ *
+ * 基类必须容错：运行时缺失时 `llmModule` 是 `{}`，而 `class X extends undefined`
+ * 会在**模块加载**阶段抛错 —— 那样下面那些 `{ skip }` 根本来不及生效，
+ * 整份文件变成"报错"而不是"跳过"（真实发生过的失效方式）。
+ */
+const AdapterBase = llmModule.LlmAdapter ?? class {}
+class StubAdapter extends AdapterBase {
   constructor() {
     super()
     this.calls = 0
