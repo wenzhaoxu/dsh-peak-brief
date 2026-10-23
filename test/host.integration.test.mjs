@@ -1677,3 +1677,51 @@ test('0 条消息的会话：不写简报、不烧模型、谷期不叫醒', asy
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ------------------------------------- lead 相位：忙着的会话先等空闲再交接
+
+test('lead 相位：会话在跑时先挂起，空闲后才生成简报（不抢跑、不阻塞 tick）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-brief-idle-'))
+  try {
+    const llm = fakeLlm(textChunks(BRIEF_JSON))
+    const { routes, listeners } = boot(
+      { enabled: true, overrides: { [TODAY]: 'peak' }, peakWindows: [['09:00', '12:00']], brief: { dir } },
+      { llm },
+    )
+
+    let releaseIdle
+    const idleGate = new Promise((resolve) => { releaseIdle = resolve })
+    const spy = { injected: [], followedUp: [] }
+    const busy = {
+      status: 'running',
+      whenIdle: () => idleGate,
+      session: {
+        id: 'sess-busy',
+        deriveMessages: () => [MSG],
+        requestHeader: () => ({ config: { provider: 'deepseek-official', model: 'deepseek-flash' } }),
+      },
+      inject: (m) => spy.injected.push(m),
+      followup: (m) => spy.followedUp.push(m),
+    }
+    addAgent(listeners, busy)
+
+    const lead = await tick(routes, `${TODAY}T08:50:00+08:00`)
+    const action = lead.json.tick.actions.find((a) => a.sessionId === 'sess-busy')
+    assert.equal(action.action, 'brief')
+    assert.equal(action.skipped, 'waiting-idle', '忙着的会话本轮不生成简报')
+    assert.equal(readdirSync(dir).length, 0, '挂起期间不写简报文件')
+    assert.equal(llm.calls.length, 0, '挂起期间不花模型调用')
+    assert.equal(action.disarm.attempted, false, '还没到停续跑的时候')
+
+    // 会话空闲下来 → 挂起的任务补上简报
+    releaseIdle()
+    const deadline = Date.now() + 2000
+    while (readdirSync(dir).length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(readdirSync(dir).length, 1, '空闲后补上简报')
+    assert.equal(llm.calls.length, 1, '只花一次模型调用')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

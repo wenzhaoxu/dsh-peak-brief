@@ -19,8 +19,11 @@ DeepSeek 官方 API 在高峰时段按 2 倍计价（北京时间工作日 `09:0
 ## 设计要点
 
 - **两段式门控**
-  - `T-leadMinutes`（默认 10 分钟）：等到会话空闲（`agent.whenIdle()`），跑一次
-    `agent.runMaintenance()` 生成简报，然后**只停"自动续跑"**——你手动操作照常。
+  - `T-leadMinutes`（默认 10 分钟）：会话**正在跑**时先有界地等它空闲
+    （`agent.whenIdle()`，截止到 **T-0 前 1 分钟**；等不到就在该截止点照常生成，
+    起点始终在高峰之前），然后生成简报、**只停"自动续跑"**——你手动操作照常。
+    简报由插件自己的 `llm.stream` 生成（**不走** `agent.runMaintenance()`）。
+    等待不阻塞调度：tick 立刻返回 `waiting-idle`，由 `whenIdle()` 或截止定时器续上。
   - `T-0`（高峰起点）：`llm/stream` waterfall 拦截一切模型请求（硬拦），
     可用 `/peak-allow [分钟]` 临时放行。
 - **简报是给 AI 的，不是给人看的**：结构化恢复要点，纯机器可读。
