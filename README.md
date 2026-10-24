@@ -1,5 +1,4 @@
-# 本项目代码部分全部由AI完成
-Jvavscpppt(doge)我不会，我只会C++
+
 
 # 关于上游「已被官方取代」的说法（已核实，2026-10-24）
 
@@ -32,6 +31,11 @@ Jvavscpppt(doge)我不会，我只会C++
 
 当前验证：`npm test` 205 项（202 pass / 0 fail / 3 skip，skip 因本机缺 `dsh-settings-file`）、
 `npm run accept` 9/9。
+
+
+# 本项目代码部分全部由AI完成
+Jvavscpppt(doge)我不会，我只会C++
+
 
 # dsh-peak-brief
 
