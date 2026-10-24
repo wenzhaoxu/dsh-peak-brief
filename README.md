@@ -1,6 +1,38 @@
 # 本项目代码部分全部由AI完成
 Jvavscpppt(doge)我不会，我只会C++
 
+# 关于上游「已被官方取代」的说法（已核实，2026-10-24）
+
+上游 README（2026-10-13 起）写着「本项目无限期搁置，该项目功能已被官方harness正式版取代」。
+**复核结论：没有找到任何官方通知，也没有找到支持该说法的实物证据。**
+
+| 核查项 | 口径 | 结果 |
+|---|---|---|
+| 官方仓是否含该功能 | `deepseek-ai/deepseek-harness` 整树 21,889 条路径搜 `peak` | **0 条**（`truncated: false`） |
+| 官方是否讨论过 | 仓内 issue/PR 搜 `peak` 与 `峰谷` | **各 0 条** |
+| 是否存在"正式版" | 官方 releases | 最新 `dsh-v0.2.1-rc.3`（2026-10-23），**全部 rc/alpha** |
+| 已装运行时 | 本机 0.2.1-rc.2 的 250 个 `@deepseek-ai/*` 包 | 无 peak / price / cost / usage 类包 |
+| 官方文档与前端产物 | README 与 `dist/assets/*.js` 搜 `峰谷`/`闲时`/`peak` | **0 命中** |
+| 生态现状 | GitHub `topic:dsh-plugin` 搜 `peak` / `峰谷` | 172 / 110 个，**全部社区个人仓**，无 `deepseek-ai` 官方仓 |
+
+⇒ 官方目前只有计量类能力（`dsh-token-meter` 的 token 估算、`dsh-schedule` 的定时提醒），
+**没有**"按峰谷时段拦截请求 / 谷期延时续跑 / 交接简报"这样的功能。
+本项目继续可用；本仓库是 fork，修复列表见下。
+
+## 本 fork 的改动（2026-10-24）
+
+上游自 2026-10-13 起未再更新。以下缺陷均已修复，且每条都有回归用例。
+
+| 提交 | 问题 | 修复 |
+|---|---|---|
+| `ad79502` | **空会话被叫醒**：0 条消息的会话也能拿到 degraded 但 `resumable: true` 的兜底简报，谷期 `followup` 把它唤醒 ⇒ 凭空多出一个没有上下文的副本，与真正被暂停的会话同时写同一个工作区（实测事故） | 简报阶段返回 `BRIEF_NO_WORK`（不写文件 / 不建周期 / 不调模型）；恢复前用 `planResumeDelivery` 按会话消息数兜底；手动入口返回 409 而非 500 |
+| `a562a76` | **真实宿主测试从未运行**：`class StubAdapter extends llmModule.LlmAdapter` 写在模块顶层，缺运行时直接抛 `Class extends value undefined`，`{ skip }` 来不及生效 ⇒ 整份文件报错，被当成"环境问题"长期忽略 | 基类兜底 + 运行时位置自动探测；8 项真实宿主用例首次真正跑通 |
+| `a3d8374` | **逃生窗口用例与运行时刻耦合**：`/peak-allow` 用真实 `now()` 盖章，`status` 用查询参数里的模拟时刻判断 ⇒ 本地 09:55 之前跑必红、之后必绿 | 用 `/debug-clock` 把两处钉到同一刻，结束复位 |
+| `61d58fe` | **lead 阶段不等空闲 + 文档失实**：README 声称 `agent.whenIdle()` 与 `agent.runMaintenance()`，代码里各 **0** 次调用；忙会话的简报会拍在回合中间，T-0 一到又被硬拦 | 有界等待空闲（截止 T-0 前 1 分钟，等待不阻塞调度）；README 同步改成实际行为 |
+
+当前验证：`npm test` 205 项（202 pass / 0 fail / 3 skip，skip 因本机缺 `dsh-settings-file`）、
+`npm run accept` 9/9。
+
 # dsh-peak-brief
 
 DSH（DeepSeek Harness）峰谷调度插件：**高峰前 N 分钟自动生成"仅供 AI 恢复用"的简报并停掉自动续跑，高峰期间硬拦模型请求（被拦的对话在谷期原地自动重发，带一键放行/取消），闲时自动注入简报继续任务。**
