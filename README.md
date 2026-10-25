@@ -351,7 +351,7 @@ holidayRefresh:
 | **设置**：插件在会话已存在时（重）加载会接管已有 agent（`agents.list()`） | 同上 |
 | **P6**：真实 cordis 的 `agent/request-error` waterfall 上，被拦请求 park 住 → 谷期返回 `{ kind: 'retry' }` → 重发的请求真的抵达适配器 | `test/real-host.test.mjs`（真 `Context` + 真 `LlmRuntime`） |
 | **P6**：五种结算（谷期/放行/取消/abort/卸载）、辅助请求不 park、关掉开关回到 P2、重启兜底被对账认领 | `test/host.integration.test.mjs` + `npm run accept` 标准 9 |
-| 设置页在**真实桌面版里出现**、且保存后相位推演真的变了 | 旧链路（`settings.register`）实测过；2026-10-25 换新 API 后**还没在运行实例上点过一次**——需要重启 Host 才能装载新代码，见「设置界面」 |
+| 新设置面在**运行实例里**被装载 | 2026-10-25 22:46 改 profile patch 触发热重载后，`GET /api/peak-brief.state` 报 `settings.via=Config`，`liveSessions` 由 8 涨到 15（`agents.list()` 接管生效）——新代码确实在跑；**但"在设置页里点一次保存"仍需人工确认** |
 | 9 条验收标准 | `npm run accept`（真实插件代码 + 时钟覆盖把一天压进几毫秒） |
 
 | **仍未验证** | 为什么 |
