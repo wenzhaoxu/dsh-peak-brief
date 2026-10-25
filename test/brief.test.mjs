@@ -12,6 +12,7 @@ import {
   fallbackBrief,
   finishError,
   generateBrief,
+  messageText,
   NO_OBJECTIVE_TEXT,
   parseBrief,
   renderBriefForResume,
@@ -77,6 +78,63 @@ test('collectTranscript 超总预算时从最老的开始丢', () => {
   assert.equal(entries.length, 2, '250 预算只装得下 2 条 100 字')
   assert.equal(stats.chars, 200)
   assert.equal(stats.truncated, true)
+})
+
+test('messageText 填满预算后立刻停手（不是"先拼完整条消息再截断"）', () => {
+  // 第二个块的 `type` 是取值器：只要实现真的先拼后截，它就会被读到并抛错。
+  // 这条用例钉住的是**内存行为**：会话里一条工具结果动辄几十 MB，
+  // 先 join 再 truncate 等于为了取前 1200 字把整条消息在堆里拼出来。
+  let touched = false
+  const trap = {
+    get type() {
+      touched = true
+      throw new Error('第二个块不该被读取')
+    },
+  }
+  const out = messageText([{ type: 'text', text: 'x'.repeat(50) }, trap], 50)
+  assert.equal(out.length, 50)
+  assert.equal(touched, false, '预算已满，后面的块不该再被访问')
+})
+
+test('messageText 不给预算时保持"全量拼接"的老语义', () => {
+  const content = [text('a'), { type: 'reasoning', text: '丢掉' }, text('b')]
+  assert.equal(messageText(content), 'a\nb')
+  assert.equal(messageText([text('x'.repeat(5000))]).length, 5000)
+})
+
+test('messageText 对单块与嵌套 tool-result 都按同一预算截断', () => {
+  const huge = `HEAD${'A'.repeat(2_000_000)}TAIL-SENTINEL`
+  const flat = messageText([{ type: 'text', text: huge }], 120)
+  assert.equal(flat.length, 120)
+  assert.equal(flat.startsWith('HEAD'), true)
+  assert.equal(flat.includes('TAIL-SENTINEL'), false, '尾部内容不该为了截断先读进来')
+
+  const nested = messageText([{
+    type: 'tool-result',
+    toolCallId: 'c1',
+    content: [{ type: 'text', text: huge }],
+    isError: false,
+  }], 120)
+  assert.equal(nested.length, 120)
+  assert.match(nested, /^<result /)
+  assert.equal(nested.includes('TAIL-SENTINEL'), false)
+})
+
+test('collectTranscript 遇到巨型工具结果只产出有界文本', () => {
+  const messages = [
+    msg('user', [text('继续')]),
+    msg('user', [{
+      type: 'tool-result',
+      toolCallId: 'c1',
+      content: [{ type: 'text', text: 'B'.repeat(3_000_000) }],
+      isError: false,
+    }]),
+  ]
+  const { entries } = collectTranscript(messages, { maxCharsPerMessage: 200 })
+  assert.equal(entries.length, 2)
+  assert.equal(entries[0].text, '继续')
+  assert.ok(entries[1].text.length <= 200, `工具结果被截到 ${entries[1].text.length} 字`)
+  assert.match(entries[1].text, /^<result /)
 })
 
 test('buildBriefRequest 用 JSON 封装，用户文字无法伪造分隔符', () => {

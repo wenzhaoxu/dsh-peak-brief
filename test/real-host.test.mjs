@@ -21,6 +21,11 @@ import { pathToFileURL } from 'node:url'
 
 import * as plugin from '../lib/index.js'
 
+// 挂载会写进程存活标记；这组用例把 DSH_HOME 指到临时目录，不碰真实 ~/.dsh。
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-peak-real-'))
+process.env.DSH_HOME = TEST_HOME
+process.on('exit', () => rmSync(TEST_HOME, { recursive: true, force: true }))
+
 /**
  * 运行时位置：环境变量 → 本机常见安装 → 打包版默认路径。
  * 之前只写死一个 Windows 路径，别的机器上这组用例从来没真正跑起来过。

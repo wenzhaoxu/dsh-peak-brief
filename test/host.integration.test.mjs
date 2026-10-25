@@ -8,6 +8,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,7 +16,24 @@ import { join } from 'node:path'
 import { apply, name, inject } from '../lib/index.js'
 import { briefPathFor, writeBriefFile } from '../lib/brief-store.js'
 import { GATE_CODE } from '../lib/gate.js'
+import { readAliveMarker, writeAliveMarker } from '../lib/lifecycle.js'
 import { zonedParts } from '../lib/tz.js'
+
+// 每次挂载都会在简报目录写一份进程存活标记（用来识别"崩溃后的重启"）。
+// 测试把 DSH_HOME 指到临时目录，免得把真实 ~/.dsh/peak-brief 里写成一次"异常退出"。
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-peak-home-'))
+process.env.DSH_HOME = TEST_HOME
+process.on('exit', () => rmSync(TEST_HOME, { recursive: true, force: true }))
+
+/**
+ * 简报目录里的**简报**文件数。
+ *
+ * 目录里还躺着一份进程存活标记 `.alive.json`（见 lib/lifecycle.js），
+ * 它不是简报，计数时必须排除，否则"没有写简报"的断言会被它顶掉。
+ */
+function briefFiles(dir) {
+  return readdirSync(dir).filter((entry) => entry.endsWith('.json') && entry.startsWith('.') === false)
+}
 
 function makeCtx(services = {}) {
   const routes = new Map()
@@ -276,6 +294,64 @@ test('集成：挂载横幅带出真实相位与日历判定', async () => {
   assert.match(notice.text, /门控：/)
   assert.equal(res.json.state.phase, 'P6+谷期续跑')
   assert.equal(typeof res.json.state.build, 'string')
+})
+
+/** 一个**确定已经退出**的 pid：起一个空进程并等它结束。 */
+function deadPid() {
+  const child = spawnSync(process.execPath, ['-e', ''], { timeout: 20000 })
+  assert.equal(child.status, 0, '探测用子进程应当正常退出')
+  return child.pid
+}
+
+test('集成：上一次宿主没正常退出时，挂载横幅如实说明会话不是本插件中断的', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-restart-'))
+  try {
+    const dead = deadPid()
+    writeAliveMarker(dir, { pid: dead, startedAt: '2026-10-24T00:26:00.000Z', stage: 'P6+谷期续跑' })
+
+    const { routes } = boot({ brief: { dir } })
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.notice.kind, 'warn', '异常重启要用 warn，别混在普通提示里')
+    assert.match(state.notice.text, /没有正常退出/)
+    assert.match(state.notice.text, new RegExp(`PID ${dead}`))
+    assert.match(state.notice.text, /不是本插件中断的/)
+    assert.match(state.notice.text, /2026-10-24T00:26:00\.000Z/, '带上上次启动时刻，便于对上宿主日志')
+    // 横幅之外还留一份结构化记录，供 /api/peak-brief.state 取证。
+    assert.deepEqual(state.restart, { pid: dead, startedAt: '2026-10-24T00:26:00.000Z' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('集成：同一进程内重复挂载不会被误判成崩溃', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-clean-'))
+  try {
+    const first = boot({ brief: { dir } })
+    const firstState = (await call(first.routes, '/api/peak-brief.state')).json.state
+    assert.equal(firstState.notice.kind, 'info')
+    assert.equal(firstState.restart, null)
+
+    // 标记里现在是我们自己的 pid（还活着），第二次挂载必须判成"干净"。
+    const second = boot({ brief: { dir } })
+    const secondState = (await call(second.routes, '/api/peak-brief.state')).json.state
+    assert.equal(secondState.notice.kind, 'info')
+    assert.equal(secondState.restart, null)
+    assert.match(secondState.notice.text, /dsh-peak-brief 已挂载/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('集成：正常卸载会清掉存活标记（下次挂载才判成干净启动）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-dispose-'))
+  try {
+    const { effectDisposers } = boot({ brief: { dir } })
+    assert.notEqual(readAliveMarker(dir), null, '挂载时应写下标记')
+    for (const dispose of [...effectDisposers].reverse()) dispose()
+    assert.equal(readAliveMarker(dir), null, '正常卸载后标记必须消失')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('集成：dispose 后路由全部注销', () => {
@@ -1660,7 +1736,7 @@ test('0 条消息的会话：不写简报、不烧模型、谷期不叫醒', asy
     const action = lead.json.tick.actions.find((a) => a.sessionId === 'sess-empty')
     assert.equal(action.action, 'brief')
     assert.equal(action.skipped, 'no-work', '空会话不应当被当成一次可交接的暂停')
-    assert.equal(readdirSync(dir).length, 0, '不写简报文件')
+    assert.equal(briefFiles(dir).length, 0, '不写简报文件')
 
     // 手动入口也应给出可解释的拒绝，而不是 500
     const manual = await call(routes, '/api/peak-brief.brief', { method: 'POST', body: {} })
@@ -1709,17 +1785,17 @@ test('lead 相位：会话在跑时先挂起，空闲后才生成简报（不抢
     const action = lead.json.tick.actions.find((a) => a.sessionId === 'sess-busy')
     assert.equal(action.action, 'brief')
     assert.equal(action.skipped, 'waiting-idle', '忙着的会话本轮不生成简报')
-    assert.equal(readdirSync(dir).length, 0, '挂起期间不写简报文件')
+    assert.equal(briefFiles(dir).length, 0, '挂起期间不写简报文件')
     assert.equal(llm.calls.length, 0, '挂起期间不花模型调用')
     assert.equal(action.disarm.attempted, false, '还没到停续跑的时候')
 
     // 会话空闲下来 → 挂起的任务补上简报
     releaseIdle()
     const deadline = Date.now() + 2000
-    while (readdirSync(dir).length === 0 && Date.now() < deadline) {
+    while (briefFiles(dir).length === 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
-    assert.equal(readdirSync(dir).length, 1, '空闲后补上简报')
+    assert.equal(briefFiles(dir).length, 1, '空闲后补上简报')
     assert.equal(llm.calls.length, 1, '只花一次模型调用')
   } finally {
     rmSync(dir, { recursive: true, force: true })

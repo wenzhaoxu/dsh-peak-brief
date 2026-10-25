@@ -8,7 +8,16 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import { apply, inject, name } from '../lib/index.js'
+
+// 挂载会写进程存活标记；烟测把 DSH_HOME 指到临时目录，不碰真实 ~/.dsh。
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-peak-smoke-'))
+process.env.DSH_HOME = TEST_HOME
+process.on('exit', () => rmSync(TEST_HOME, { recursive: true, force: true }))
 
 /** 假 cordis ctx：记录路由、事件监听器与 effect 清理器。 */
 export function makeCtx() {

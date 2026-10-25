@@ -31,7 +31,7 @@
     "README.md"
   ],
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/client.js",
+    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/lifecycle.js && node --check lib/brief.js",
     "test": "node --test",
     "accept": "node scripts/acceptance.mjs",
     "build:holidays": "node scripts/build-holidays.mjs",

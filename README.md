@@ -30,8 +30,58 @@ Jvavscpppt(doge)我不会，我只会C++
 | `a3d8374` | **逃生窗口用例与运行时刻耦合**：`/peak-allow` 用真实 `now()` 盖章，`status` 用查询参数里的模拟时刻判断 ⇒ 本地 09:55 之前跑必红、之后必绿 | 用 `/debug-clock` 把两处钉到同一刻，结束复位 |
 | `61d58fe` | **lead 阶段不等空闲 + 文档失实**：README 声称 `agent.whenIdle()` 与 `agent.runMaintenance()`，代码里各 **0** 次调用；忙会话的简报会拍在回合中间，T-0 一到又被硬拦 | 有界等待空闲（截止 T-0 前 1 分钟，等待不阻塞调度）；README 同步改成实际行为 |
 
-当前验证：`npm test` 205 项（202 pass / 0 fail / 3 skip，skip 因本机缺 `dsh-settings-file`）、
+当前验证：`npm test` 221 项（218 pass / 0 fail / 3 skip，skip 因本机缺 `dsh-settings-file`）、
 `npm run accept` 9/9。
+
+## 事故复盘：横幅出现＝会话全断？（2026-10-25，已修）
+
+**现象**：好几个会话正在跑，屏幕上弹出挂载横幅的那一瞬间，全部会话一起中断：
+
+```
+dsh-peak-brief 已挂载（P6+谷期续跑）
+当前：2026-10-25 20:12 · 周末 · 相位 off
+门控：硬拦已启用
+下次切换：2026-10-26 → lead
+```
+
+**实测根因**：中断和插件无关，横幅是**中断之后**才出现的。宿主 `dsh-web` 在
+20:11:47 撞 V8 堆上限（`FATAL ERROR: Reached heap limit`，原生栈停在 `JSON.parse`
+建巨型数组），SIGABRT 之后 systemd 20:12:30 拉起新进程；新进程装载插件 → `apply()`
+推横幅。于是"横幅 + 会话全断"只是**重启前后**的先后关系，箭头方向和直觉相反。
+
+三条证据（都留在本机，可复查）：
+
+| 证据 | 内容 |
+|---|---|
+| `journalctl --user -u dsh-web` | 20:11:47 `Reached heap limit Allocation failed`；20:12:25 `Main process exited, code=dumped, status=6/ABRT`；20:12:30 重启 |
+| 会话日志 | 崩溃时在跑的回合没有正常收尾；重启后 DSH 用 `openTurnClosers()` 补了一条 `turn/end {kind:"interrupted"}`，**时间戳沿用最后一条事件**（20:11:45.786）——那是"事后补记"，不是当时的中断 |
+| 插件自身状态 | 那 44 小时全是周末：`tickCount=0`、`~/.dsh/peak-brief/` 无新简报、`blockedCount=0`；除 `/api/peak-brief.state` 轮询外没做任何事，而 6000 次轮询实测 cgroup 内存平稳（无泄漏） |
+
+**这次的修法**（都在本仓内）：
+
+1. **横幅不再冒充原因**（`lib/lifecycle.js`）：挂载时写一份 `{ pid, startedAt }`
+   （`.alive.json`），正常卸载时删掉。下次挂载若发现"标记还在、pid 已消失"，
+   横幅换成 `warn` 并写明：**上一次宿主进程没有正常退出，正在运行的会话是在它被
+   系统结束/重启的那一刻中断的，不是本插件中断的**。同时 `GET /api/peak-brief.state`
+   的 `state.restart` 给出同一份结构化记录。
+   边界：pid 还活着（web + headless 共用一个 `DSH_HOME`）或 pid 就是自己（热重载）
+   都不算崩溃。
+2. **本插件永不成为 OOM 的放大器**（`lib/brief.js`）：`collectTranscript()` 之前是
+   "先 join 整条消息、再截到 1200 字"——会话里一条工具结果动辄几十 MB（构建日志、
+   整文件内容），在宿主堆接近上限时足以把进程推下去，而进程一死所有会话一起断。
+   现在改成**逐块截断、预算满了立刻停手**（`messageText()`），并有用例用取值器钉住
+   "预算满了就不许再碰后面的块"。
+3. **`agent/created` 监听器整体兜住**：这个事件在 `dsh-agent` 里是 `serial` 的，
+   监听器抛错会让 `announce()` reject、agent 注册回滚，刚恢复的会话直接被拆掉。
+   重启对账只是锦上添花，不配拥有"杀会话"的权力。
+4. `agent/disposed` 时一并清掉该会话的内存记录（落盘简报不动——文件存在 ⟺ 有一次
+   未恢复的暂停）。
+
+> 顺带说明：这次崩溃也**不是本插件的内存**造成的。宿主当时常驻 7–8 个巨型会话
+> （最大的会话压缩后 20 MB），堆已经接近上限，任何一次大分配都可能成为最后一根稻草。
+> 想从根上减少这类中断，得给宿主留出堆余量（`NODE_OPTIONS=--max-old-space-size=…`），
+> 并把 `dsh-web` 的 cgroup 内存看门狗阈值放在堆上限**之下**——否则看门狗还没醒，
+> V8 先死了。
 
 # dsh-peak-brief
 
