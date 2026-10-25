@@ -19,9 +19,20 @@ Jvavscpppt(doge)我不会，我只会C++
 **没有**"按峰谷时段拦截请求 / 谷期延时续跑 / 交接简报"这样的功能。
 本项目继续可用；本仓库是 fork，修复列表见下。
 
-## 本 fork 的改动（2026-10-24）
+## 本 fork 的改动
 
 上游自 2026-10-13 起未再更新。以下缺陷均已修复，且每条都有回归用例。
+
+### 2026-10-25
+
+| 问题 | 修复 |
+|---|---|
+| **设置面整体失效**：旧实现用 `ctx.settings.register()` + 客户端 `ctx.settingsScope.bind()`，这两个 API 在当前 DSH 里已不存在（运行实例长期 `register-failed: settingsCtx.settings.register is not a function`） | 按新 API 重写：导出 schemastery `Config`（9 个 volatile 字段）→ `SettingsForms` 生成原生设置页；语义校验挂 `internal/config` waterfall；热更新走 `loader/volatile-update`（不重载插件）。客户端设置页整段删除（876 → 357 行） |
+| **宿主崩溃被误读成插件中断会话**（见下方事故复盘） | `lib/lifecycle.js` 进程存活标记：异常重启后的横幅直说"会话是宿主被结束时中断的，不是本插件" |
+| **转录构造会先拼出整条消息再截断**：一条几十 MB 的工具结果可能在宿主堆接近上限时把进程推下去 | `messageText()` 逐块截断、预算满即停手（含用例用取值器证明"预算满了不再碰后面的块"） |
+| **`agent/created` 监听器抛错会拆掉刚恢复的会话**（该事件是 serial 的，异常会让 `announce()` reject、注册回滚） | 整段 try/catch；`agent/disposed` 同步清内存记录；插件（重）加载时用 `agents.list()` 接管已有会话 |
+
+### 2026-10-24
 
 | 提交 | 问题 | 修复 |
 |---|---|---|
@@ -30,8 +41,9 @@ Jvavscpppt(doge)我不会，我只会C++
 | `a3d8374` | **逃生窗口用例与运行时刻耦合**：`/peak-allow` 用真实 `now()` 盖章，`status` 用查询参数里的模拟时刻判断 ⇒ 本地 09:55 之前跑必红、之后必绿 | 用 `/debug-clock` 把两处钉到同一刻，结束复位 |
 | `61d58fe` | **lead 阶段不等空闲 + 文档失实**：README 声称 `agent.whenIdle()` 与 `agent.runMaintenance()`，代码里各 **0** 次调用；忙会话的简报会拍在回合中间，T-0 一到又被硬拦 | 有界等待空闲（截止 T-0 前 1 分钟，等待不阻塞调度）；README 同步改成实际行为 |
 
-当前验证：`npm test` 221 项（218 pass / 0 fail / 3 skip，skip 因本机缺 `dsh-settings-file`）、
-`npm run accept` 9/9。
+当前验证：`npm test` **210 项（210 pass / 0 fail / 0 skip）**、`npm run accept` **9/9**。
+（旧版有 3 项 skip——真实设置服务要 `dsh-settings-file`；换成 `Config` 后这组用例改用
+真实 cordis + 真实 schemastery，不再需要那个包。）
 
 ## 事故复盘：横幅出现＝会话全断？（2026-10-25，已修）
 
@@ -79,9 +91,19 @@ dsh-peak-brief 已挂载（P6+谷期续跑）
 
 > 顺带说明：这次崩溃也**不是本插件的内存**造成的。宿主当时常驻 7–8 个巨型会话
 > （最大的会话压缩后 20 MB），堆已经接近上限，任何一次大分配都可能成为最后一根稻草。
-> 想从根上减少这类中断，得给宿主留出堆余量（`NODE_OPTIONS=--max-old-space-size=…`），
-> 并把 `dsh-web` 的 cgroup 内存看门狗阈值放在堆上限**之下**——否则看门狗还没醒，
-> V8 先死了。
+>
+> 2026-10-25 已按这个结论调整宿主侧配置（`~/.config/systemd/user/`）：
+>
+> | 项 | 旧 | 新 |
+> |---|---|---|
+> | V8 堆上限（`NODE_OPTIONS`） | 默认 2096 MB | `--max-old-space-size=2560` |
+> | 看门狗阈值（`DSH_WEB_MEM_GUARD_KB`） | 1.2 GiB | **2.25 GiB** |
+> | 看门狗采样间隔 | 3 min | **1 min** |
+> | `MemoryHigh` / `MemoryMax` | 2G / 3G | **3G / 4G** |
+>
+> 意图很直白：**让看门狗先于 V8 动手**。旧配置下看门狗阈值（1.2 GiB cgroup）
+> 只是略高于崩溃点（1.16 GiB），采样还隔 3 分钟——V8 在两次采样之间就死了。
+> 注意：改完要 `systemctl --user daemon-reload`（并重启 timer / dsh-web）才生效。
 
 # dsh-peak-brief
 
@@ -149,11 +171,11 @@ DeepSeek 官方 API 在高峰时段按 2 倍计价（北京时间工作日 `09:0
 
 面向**模型**而非人：紧凑、结构化、不追求可读性。三条设计约束：
 
-1. **零依赖**。外部挂载（绝对路径）的插件解析不到 `@deepseek-ai/*` 裸包名——
-   profile 的 `.dsh-module-fallback/node_modules` 里**只有客户端种子模块**
-   （`dsh-client-ui-primitives` / `dsh-client-ui-slots`），没有 host 包。
-   所以这里既不 `import BlockAssembler`，也不 `import createUserMessage`：
-   文本自己累积（`lib/brief.js` 的 `createStreamCollector`），消息字面量自己拼。
+1. **不 import DSH 的内部实现**。这里既不 `import BlockAssembler`，也不
+   `import createUserMessage`：文本自己累积（`lib/brief.js` 的 `createStreamCollector`），
+   消息字面量自己拼。理由不是"裸包名解析不到"（2026-10-25 复核发现 framework seed
+   `@deepseek-ai/schemastery` / `@deepseek-ai/cosmokit` 是可解析的，设置面已经在用，
+   见「设置界面」），而是**不把内部类当成稳定契约**：它们不在插件的公开接口里。
 2. **失败即降级，绝不丢工作**。模型不可用、输出不可解析、输出被截断、输入超预算——
    任何一种都退到不花钱的 `fallbackBrief()`（用 goal 目标或最后一条用户消息），
    并标记 `degraded: true` + 弹一条 `warn` 横幅。"没有简报就不许恢复"会让
@@ -323,12 +345,13 @@ holidayRefresh:
 | 我们构造的终止 chunk 能被官方 `BlockAssembler` 正确消费（不是自说自话的形状） | 同上 |
 | 卸载后路由与 waterfall 监听一并拆除 | 同上（`fork.dispose()`） |
 | Client 半身：注册工厂、挂进 `shell.overlay`、渲染出文案与关闭按钮、点关闭 POST dismiss 并本地隐藏、React 缺失时降级 | `test/client.test.mjs`（`vm` + React/DOM shim **真实执行** bundle 并展开组件树） |
-| 设置页：注册 `settings.section`、渲染全部字段、保存写出正确的路径操作与 revision、非法输入不写盘、恢复默认走 `unset`、Host 拒绝时展示原因 | 同上 |
-| **设置**：手写 schema 被官方 `FileSettingsProvider` 接受（注册 / `describe()` / `toJSON()`） | `test/real-host.test.mjs`（真实 `dsh-settings-file`） |
-| **设置**：真实 `update()` 即时生效、`replace({})` 回退、非法写入被真实 provider 拒绝且不污染生效配置 | 同上 |
+| **设置**：`Config` 是 schemastery schema、只有 9 个 volatile 字段可编辑、`toJSON()` 能 round-trip（`SettingsForms` 的 `plainSchema()` 依赖它） | `test/settings.test.mjs` + `test/real-host.test.mjs` |
+| **设置**：真实 cordis 把 `Config` 解析成 Ref；`updateVolatile()` + `loader/volatile-update` 后**不重载插件**就真的开始拦 | `test/real-host.test.mjs`（真 `Context` + 真 `LlmRuntime`） |
+| **设置**：语义校验（时区/重叠/覆盖键）挂在 `internal/config` 上，写盘前抛错 | `test/host.integration.test.mjs` |
+| **设置**：插件在会话已存在时（重）加载会接管已有 agent（`agents.list()`） | 同上 |
 | **P6**：真实 cordis 的 `agent/request-error` waterfall 上，被拦请求 park 住 → 谷期返回 `{ kind: 'retry' }` → 重发的请求真的抵达适配器 | `test/real-host.test.mjs`（真 `Context` + 真 `LlmRuntime`） |
 | **P6**：五种结算（谷期/放行/取消/abort/卸载）、辅助请求不 park、关掉开关回到 P2、重启兜底被对账认领 | `test/host.integration.test.mjs` + `npm run accept` 标准 9 |
-| 设置页在**真实桌面版里出现**，且真的写进了 `settings.yaml` 并即时改变相位推演 | 在运行实例上实测（见「客户端半个必须声明 inject」「写入链路实测结论」） |
+| 设置页在**真实桌面版里出现**、且保存后相位推演真的变了 | 旧链路（`settings.register`）实测过；2026-10-25 换新 API 后**还没在运行实例上点过一次**——需要重启 Host 才能装载新代码，见「设置界面」 |
 | 9 条验收标准 | `npm run accept`（真实插件代码 + 时钟覆盖把一天压进几毫秒） |
 
 | **仍未验证** | 为什么 |
@@ -342,50 +365,64 @@ holidayRefresh:
 > 残余风险是**有界的**：插件装载、设置页注册与写入、核心拦截机制都已在真实运行时上跑通，
 > 剩下的是具体服务契约（goal/agent/session）与"真拦一次活会话"这种需要你本人点头的操作。
 
-## 设置界面
+## 设置界面（2026-10-25 按新 API 重写）
 
-「**设置 → 峰谷调度**」是一整页配置界面，可改：启用开关、提前量、时区、高峰时段、
+「**设置 → 峰谷调度**」仍是同一个页面，可改：启用开关、提前量、时区、高峰时段、
 高峰拦截模式、是否连辅助请求一起拦、**被拦对话是否在谷期自动续跑**、提示方式、按日手动覆盖。
-另有"保存 / 恢复默认 / 关闭"与一条实时运行状态（当前相位、下次切换、已拦截次数）。
 
-**数据流**（Host 与 Client 各一半，都不自己存配置）：
+但**实现换了一整条路**：旧实现调用 `ctx.settings.register(ns, schema, {base, applies})` +
+客户端的 `ctx.settingsScope.bind({namespace})`，而在当前 DSH（0.2.1-rc.2）里这两个 API
+**都不存在**——运行实例的 `state.status.settings` 长期是
+`register-failed: settingsCtx.settings.register is not a function`，也就是设置页早已失效，
+只是没人从这条状态里读出来。
 
-```
-Host   ctx.settings.register('peak-brief', schema, { base: patch配置, applies: 'live' })
-         └─ scope.watch(next => applyConfig(next))   ← 写入后**即时生效**，无需重启
-Client ctx.settingsScope.bind({ namespace: 'peak-brief' })
-         └─ slots.register({ name: 'settings.section', id, order, label }, PeakBriefSettings)
-```
-
-三个要点：
-
-1. **解析顺序是 schema 默认 → `base`（patch 层配置）→ 用户设置层**。
-   所以设置页里"恢复默认"用的是 `unset` 全部字段（清空用户层），
-   结果回退到**你在 patch 里写的值**，而不是硬回内置默认。
-2. **非法配置存不进去**，这是结构性保证而不是 UI 礼貌：dsh-settings 的写入路径会调用
-   `schema(merged)`，而我们的 schema 在遇到非法值（时区名、时段重叠、越界提前量……）
-   时**抛错**，那次写入就被拒绝，生效配置保持不变。
-3. **可选依赖**。用 `ctx.inject(['settings'], …)` 而不是把 `settings` 写进 `inject`：
-   cordis 的硬 inject 缺一个服务会让**整个插件拒绝加载**，而门控/简报/恢复都不依赖它
-   （这一点是实测出来的：直接访问 `ctx.settings` 会抛
-   `cannot get property "settings" without inject`）。
-
-### 客户端半个必须声明 `inject = ['slots']`（踩过的坑，附证据）
-
-设置页曾经**完全不出现**，而所有单元测试全绿。根因不在注册代码，而在**启动顺序**：
+### 新链路：插件只导出 `Config`
 
 ```
-渲染器 apply:  new SlotRegistry(ctx).install(...)   ← `slots` 服务在这里才被提供
-我们的 apply:  在它之前跑了 → ctx.get('slots') === undefined
-                → 两处槽位注册整段被跳过（悄悄退化成 react-dom 自建容器）
+插件      export const Config = z.object({ … z.boolean().default(false).volatile() … })
+SettingsForms.describe()  ← 读 entry.fiber.runtime.Config，把 volatile 字段做成一个 section
+设置页保存 → SettingsForms.update(entryId, patch) → configEditor.edit()
+          → internal/config waterfall（我们的语义校验在这里抛错 = 写入被拒）
+          → 写 profile patch（cordis.patch.yml）
+          → cordis loader 判定"只动了 volatile 字段" → **不重载插件**，
+            就地 updateVolatile(refs) 并 emit `loader/volatile-update`
+          → 我们重建 calendar/windows/gate、重排定时器、重新结算 park
 ```
 
-`ctx.get(name)` 是**可选查找**（不等服务就绪）。插件 `inject` 为空时，apply 会抢在渲染器
-之前跑；这是**竞态**，所以表现时而正常、时而消失。官方插件（`settings-general` 等）
-全都声明了 `inject = ['slots', 'locale', ...]`，就是把顺序交给 cordis 而不是交给运气。
+四条硬约束（都写在 `lib/settings.js` 的注释里，且被测试钉住）：
 
-修法：`exports.inject = ['slots']`。`settingsScope` **故意不声明**——它可能永不可用，
-硬声明会让 apply 永不执行，所以那条路继续走可选的 `ctx.inject(['settingsScope'], …)` 并自报。
+1. **只有 `.volatile()` 字段会出现在设置页、也只有它们能就地热更新**。
+   `brief` / `holidayRefresh` 是部署参数，故意不标 volatile：改它们会让插件整体重载。
+2. **volatile 不能嵌套**（`cordis-plugin-loader` 的 `validateVolatileSchema()` 会直接抛错），
+   所以要么标叶子，要么整块标——本插件按字段标。
+3. **形状归 schema，语义归 `normalizeConfig()`**。schema 管类型/枚举/默认值（`SettingsForms`
+   和 `configEditor.edit()` 在写盘前都会跑它）；时区是否合法、时段是否重叠、覆盖键是不是日期
+   这些跨字段规则挂在 `internal/config` waterfall 上，同样在写盘前抛错——**"非法配置存不进去"
+   仍然是结构性保证**，不是 UI 礼貌。
+4. **插件不再自己注册任何 settings 命名空间**，也不需要 `settings` 服务；
+   `state.status.settings` 现在报告 `{ via: 'Config', editable: [...] }`，供排障对照。
+
+### 依赖边界（更正旧结论）
+
+旧版 README 说"外部挂载的插件解析不到任何 `@deepseek-ai/*` 裸包名"，据此手写了一个
+"函数 + toJSON"的伪 schema。**这条已经过时**：profile 的 `node_modules` 里现在有 DSH
+给外部宿主插件准备的 framework seed，实测从插件目录可以解析：
+
+```bash
+cd ~/.dsh/profiles/web/plugins/dsh-peak-brief
+node -e "import('@deepseek-ai/schemastery').then(m => console.log(typeof m.default))"   # function
+node -e "import('@deepseek-ai/cosmokit').then(m => console.log(typeof m.default.isVolatile ?? m.isVolatile))"
+```
+
+所以 `Config` 用真的 schemastery，`unwrapConfig()` 用 cosmokit 的 `isVolatile`。
+其余仍然零依赖（`lib/*.js` 之间只用相对导入，不碰任何第三方包）。
+
+### 客户端现在只剩一条横幅
+
+设置页交给原生 UI 之后，`lib/client.js` 从 876 行降到 **357 行**：只保留
+`shell.overlay` 的提示横幅（高峰拦截 / 简报 / 恢复提醒 + 一键放行 / 取消推迟）。
+`inject` 仍必须声明 `['slots']`——客户端曾经因为 inject 为空、apply 抢在渲染器
+`new SlotRegistry(ctx)` 之前跑，导致槽位注册整段被跳过（`client apply 已执行（slots=不可用）`）。
 
 ### 逃生按钮为什么必须在客户端（不能只靠 `/peak-allow`）
 
@@ -398,26 +435,19 @@ Client ctx.settingsScope.bind({ namespace: 'peak-brief' })
 `/api/peak-brief.allow`。没在拦的时候不显示这个按钮（免得把"高峰前简报"误当成拦截）。
 
 实测（运行实例）：`POST /api/peak-brief.allow {minutes:30}` → `allow.active=true`，
-`POST /api/peak-brief.allow-off` → `active=false`。另有兜底：**设置页里关掉「启用」并保存**
-同样能立刻停掉拦截，这条路也不需要模型回合。
+`POST /api/peak-brief.allow-off` → `active=false`。另有兜底：**在原生设置页里关掉「启用」**
+同样能立刻停掉拦截，这条路也不需要模型回合（只动 volatile 字段，不重载插件）。
 
 ### 诊断通道（浏览器里发生的事，后端看得见）
 
 客户端把关键结论 POST 回 `/api/peak-brief.hello`，Host 存进 `state.notice`
-（`GET /api/peak-brief.state` 可读，客户端浮层也会显示）。当前会上报：
+（`GET /api/peak-brief.state` 可读）。现在会上报：
 
 | 文本 | 含义 |
 |---|---|
-| `client apply 已执行（inject=[...] slots=可用/不可用）` | bundle 真的在浏览器里跑了；同时暴露服务竞态 |
-| `settings-section: 已提交注册（…）` | 已调用 `slots.inject('settings.section', …)`（**不等于**注册成功） |
-| `settings-section 终态：where=… spec=已声明/未声明 entries=N ids=… registered=是/否` | **确定信号**：读槽位台账——我们有没有真的进 `settings.section` |
-| `settings-section 渲染报错：…` | 注册成功但组件渲染时抛错（走 `slots.onEntryError`） |
-
-`slots.inject` 的**延迟语义**很关键：槽位被声明时回调才跑，而且它抛错**不会**被外面
-`try/catch` 到（回调在声明者的 `register()` 里执行）。所以回调内部自带 `try/catch`，
-另有一个 4 秒看门狗：槽位已声明却没进去就直连重试一次，仍失败则把台账写回后端。
-
-实测确认（桌面版，运行实例）：`spec=已声明 entries=1 ids=dsh-peak-brief registered=是`。
+| `client apply 已执行（inject=[...] slots=可用/不可用）` | bundle 真的在浏览器里跑了；同时暴露 slots 服务竞态 |
+| `client apply 补挂：slots 迟到 Nms` | 轮询兜底生效 |
+| `client apply 兜底：5 秒内 slots 一直不可用` | 退化到 react-dom 自建容器 |
 
 ### 桌面版的刷新 / 重启边界（实测）
 
@@ -426,36 +456,8 @@ Client ctx.settingsScope.bind({ namespace: 'peak-brief' })
 | 改了什么 | 生效方式 |
 |---|---|
 | `lib/client.js` | **只需 Ctrl+R**（Host 每次按内容重新提供 `/plugins` bundle，实测抓包核对过） |
-| `lib/index.js` 等 Host 半个 | 关窗（会连带 `taskkill /T` 结束整棵 dsh 进程树）后重开 `actdsh.exe` |
+| `lib/index.js` / `lib/settings.js` 等 Host 半个 | 关窗（会连带 `taskkill /T` 结束整棵 dsh 进程树）后重开 `actdsh.exe` |
 | 排障 | 窗口内 **Alt** 唤出菜单栏 → View → Toggle Developer Tools；Ctrl+R 刷新 |
-
-### 写入链路实测结论
-
-设置页保存 → `settings.yaml` 落盘 → 生效配置即时改变 → **参与相位推演**：
-
-```
-改「提前量」10 → 20 并保存
-  settings.yaml:            leadMinutes: 20
-  GET /api/peak-brief.state: config.leadMinutes=20（无重启）
-  status.nextSwitch:        2026-09-21T00:50:00Z → 2026-09-21T00:40:00Z
-```
-
-最后一行是重点：提前量不是"存了个数"，它真的把下次进入 `lead` 的时刻往前挪了 10 分钟。
-
-### 为什么 schema 是手写的
-
-外部挂载的插件**解析不到裸包名**（实测 `@deepseek-ai/schemastery`、
-`@deepseek-ai/cordis`、`schemastery` 全部 `ERR_MODULE_NOT_FOUND`），所以不能用
-`schemastery` 的 `Schema`。而 dsh-settings 只以两种方式碰 schema：
-
-```js
-resolve():  const value = schema(mergeLayers(base, section))   // 可调用
-describe(): registration.schema.toJSON()                        // 需要一个 toJSON
-```
-
-于是 `lib/settings.js` 给出一个**可调用的函数 + `toJSON()`**，两个调用点都满足。
-这一点已用**真实的 `FileSettingsProvider`** 验证过：注册、`describe()`、写入、拒绝非法写入
-四条路径都跑通了。
 
 ## 目录结构
 
@@ -478,7 +480,9 @@ dsh-peak-brief/
   lib/resume.js             周期决策、目标授权、恢复消息构造
   lib/settings.js           配置契约：默认值、规范化、校验、可调用 schema
   lib/index.js              Host 半身（ESM，无构建）
-  lib/client.js             Client 半身（经典脚本 bundle，免构建）
+  lib/settings.js           配置契约：schemastery Config（volatile）+ 语义校验
+  lib/lifecycle.js          进程存活标记：识别"宿主崩溃后的重启"
+  lib/client.js             Client 半身（经典脚本 bundle，免构建；只剩浮层横幅）
   test/                     calendar / windows / host 集成 / smoke
 ```
 
@@ -522,20 +526,27 @@ npm run verify:package   # 打包体检：pack → 解包 → 在解出来的副
 
 为什么需要它：`files` 漏一个目录，**本地测试照样全绿** —— 因为本地测试读的是工作区，
 而别人装的是 tarball。这个脚本把 npm 真正会发出的东西打出来、解到临时目录，
-再在**那个副本里**跑完整测试与验收（不读工作区）。7 项检查：
+再在**那个副本里**跑完整测试与验收（不读工作区）。8 项检查：
 
 | # | 检查 | 为什么重要 |
 |---|---|---|
 | 1 | `npm pack` 成功 | 清单本身合法 |
 | 2 | tarball 含全部必需文件（`lib/`、`scripts/`、`data/`、`cordis.patch.yml`、`LICENSE`） | `scripts/` 与 `data/` 曾经漏掉：装完 `npm run accept` / `build:holidays` 直接不可用 |
 | 3 | 解包成功 | 归档真的能装 |
-| 4 | `lib/` 只 import 相对路径与 `node:` 内置模块 | 零依赖是硬约束（外挂插件解析不了裸模块说明符） |
-| 5 | 副本里 `node --test` 全通过 | 177/177，测的是**发出去的那份** |
+| 4 | `lib/` 只 import 相对路径、`node:` 内置模块与两个 DSH framework seed | 第三方 npm 依赖是硬禁；`@deepseek-ai/schemastery` / `@deepseek-ai/cosmokit` 是 DSH 给外挂宿主插件准备的 seed（设置面必须用真 schemastery，见「设置界面」） |
+| 4.5 | 把 framework seed 链进副本的 `node_modules` | 副本在 `/tmp` 下向上找不到 profile 的 seed，而 ESM 不认 `NODE_PATH`；链进去才能在"与挂载点相同的解析规则"下跑测试 |
+| 5 | 副本里 `node --test` 全通过 | **213/213**，测的是**发出去的那份** |
 | 6 | 副本里 `npm run accept` 通过 | 9/9 验收 |
 | 7 | `scripts/build-holidays.mjs` 可重跑且产出字节不变 | **抓到过真实漂移**：头部原本写 `生成时间：<now>`，每次重跑都产生一条假 diff，"重跑再 diff"这个漂移检查因此完全失效；现已改为确定性的数据指纹 |
 
-当前 tarball：**32 个文件 / 约 111 KB**（含 `scripts/`、`data/`、`test/`）。
+当前 tarball：**36 个文件 / 约 139 KB**（含 `scripts/`、`data/`、`test/`）。
 
+> **框架 seed 的解析前提**：`Config` 要用 `@deepseek-ai/schemastery`，`unwrapConfig()`
+> 要用 `@deepseek-ai/cosmokit`。它们是 DSH 放在 `$DSH_HOME/profiles/<profile>/node_modules`
+> 里的 framework seed，**按目录向上解析**——所以挂载点必须在 profile 目录内
+> （本仓的推荐位置就是 `profiles/web/plugins/dsh-peak-brief/`）。把插件 clone 到
+> `/opt` 之类的地方再挂载，会因解析不到这两个 seed 而装载失败。
+>
 > **`private: true` 是故意的**：它挡掉误发 npm（本插件目前只走 git 分发）。
 > 若将来要发布到 npm / 插件市场，删掉这一行即可，其余字段（`repository` /
 > `homepage` / `bugs` / `keywords` / `exports["./client"]`）都已就位。
@@ -562,7 +573,12 @@ git clone https://github.com/rinttt233/dsh-peak-brief.git
 
 绝对路径挂载之所以可行：`@deepseek-ai/dsh-client-modules` 的 `nearestPackage()`
 会从入口文件向上找最近的 `package.json`，据此读 `dsh.client.platform`
-并解析 `exports["./client"]`。**无需 npm 安装**，整个插件就是一个自包含文件夹。
+并解析 `exports["./client"]`。**无需 npm 安装**，整个插件就是一个文件夹。
+
+⚠️ 唯一的解析要求：插件目录必须能**向上找到** profile 的 `node_modules`
+（其中提供 `@deepseek-ai/schemastery` / `@deepseek-ai/cosmokit` 两个 framework seed）。
+所以请把插件放在 `$DSH_HOME/profiles/<profile>/plugins/` 下（或 profile 目录内的任意位置），
+不要 clone 到 profile 之外再挂载。
 
 ## 开发闭环（实测结论，含一个反直觉的坑）
 

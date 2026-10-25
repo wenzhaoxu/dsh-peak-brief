@@ -13,9 +13,12 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
+
 import { apply, name, inject } from '../lib/index.js'
 import { briefPathFor, writeBriefFile } from '../lib/brief-store.js'
 import { GATE_CODE } from '../lib/gate.js'
+import { DEFAULT_CONFIG } from '../lib/settings.js'
 import { readAliveMarker, writeAliveMarker } from '../lib/lifecycle.js'
 import { zonedParts } from '../lib/tz.js'
 
@@ -41,7 +44,11 @@ function makeCtx(services = {}) {
   const logs = []
   const effectDisposers = []
   const ctx = {
-    logger: { info: (m) => logs.push(m) },
+    logger: {
+      info: (m) => logs.push(m),
+      // warn 也收进 logs：很多用例要断言"失败必须留痕，不许静默"。
+      warn: (m) => logs.push(`WARN ${m}`),
+    },
     ...services,
     effect(fn) {
       const dispose = fn()
@@ -54,6 +61,10 @@ function makeCtx(services = {}) {
       list.push(handler)
       listeners.set(event, list)
       return () => listeners.set(event, (listeners.get(event) ?? []).filter((h) => h !== handler))
+    },
+    /** 模拟 cordis 的事件派发（`loader/volatile-update` 这类广播用）。 */
+    emit(event, ...args) {
+      for (const handler of [...(listeners.get(event) ?? [])]) handler(...args)
     },
     /** 模型 cordis 的可选依赖注入：依赖齐了才跑回调。 */
     inject(deps, callback) {
@@ -1098,132 +1109,120 @@ test('联网刷新：启动时自动跑（onStart 默认开）', async () => {
   }
 })
 
-// ---------------------------------------------------------------- 设置命名空间
+// ---------------------------------------------------------------- 设置（Config / SettingsForms）
 
-/** 假 settings 服务：真的按 "schema 默认 → base → 用户层" 解析，并真的触发 watch。 */
-function makeSettings() {
-  const registrations = new Map()
-  return {
-    registrations,
-    register(ns, schema, options = {}) {
-      assert.equal(registrations.has(ns), false, `命名空间重复注册：${ns}`)
-      const base = options.base ?? {}
-      let user = {}
-      const record = { schema, options, watcher: null, getUser: () => ({ ...user }) }
-      const resolve = () => schema({ ...base, ...user })
-      const fire = () => { if (record.watcher !== null) record.watcher(resolve()) }
-      record.setUser = (next) => { user = { ...next }; fire() }
-      record.patchUser = (patch) => { user = { ...user, ...patch }; fire() }
-      record.resolve = resolve
-      record.scope = {
-        get: () => resolve(),
-        watch(cb) { record.watcher = cb; return () => { record.watcher = null } },
-        update: async (patch) => { record.patchUser(patch) },
-        replace: async (section) => { user = { ...section }; fire() },
-      }
-      registrations.set(ns, record)
-      return record.scope
-    },
-  }
+/** `Config` 里标了 volatile 的字段（＝设置页可编辑、可热更新的字段）。 */
+const VOLATILE_KEYS = [
+  'enabled',
+  'timezone',
+  'leadMinutes',
+  'peakWindows',
+  'notify',
+  'gateMode',
+  'blockAuxiliary',
+  'resumeBlocked',
+  'overrides',
+]
+
+/**
+ * 造一份"真实宿主形态"的配置：volatile 字段用 `createVolatile()` 包成 Ref，
+ * 非 volatile 字段（brief / holidayRefresh）保持普通值。
+ *
+ * 这就是 cordis `resolveConfig()` 交给 `apply()` 的形状——`SettingsForms` 写的也是
+ * 这些 ref，热更新时 loader 就地 `updateVolatile()`，插件重新读 ref 即可。
+ */
+function refConfig(patch = {}) {
+  const cfg = { ...DEFAULT_CONFIG, ...patch }
+  for (const key of VOLATILE_KEYS) cfg[key] = createVolatile(cfg[key])
+  return cfg
 }
 
-test('设置：注册 peak-brief 命名空间，并把 patch 配置作为 base 层', async () => {
-  const settings = makeSettings()
-  const { routes } = boot({ leadMinutes: 33, timezone: 'UTC' }, { settings })
-
-  const record = settings.registrations.get('peak-brief')
-  assert.ok(record, '必须注册 peak-brief 命名空间')
-  assert.equal(record.options.applies, 'live', '声明为即时生效')
-  assert.deepEqual(record.options.base, { leadMinutes: 33, timezone: 'UTC' }, 'base 必须是 patch 层里的组合配置')
-
+test('设置：status.settings 如实报告设置面走 Config（不再自注册命名空间）', async () => {
+  const { routes } = boot({})
   const status = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(status.settings.registered, true)
-  assert.equal(status.settings.namespace, 'peak-brief')
-  assert.equal(status.leadMinutes, 33, '解析结果应当用上 base 层')
-  assert.equal(status.timezone, 'UTC')
+  assert.equal(status.settings.via, 'Config')
+  assert.match(status.settings.service, /SettingsForms/)
+  assert.deepEqual(status.settings.editable, VOLATILE_KEYS)
+  assert.equal('registered' in status.settings, false, '旧 API 的 registered 字段不该再出现')
 })
 
-test('设置：写入后**即时生效**（无需重启）', async () => {
-  const settings = makeSettings()
-  // 显式把 TODAY 覆盖成 off 再断言"写入前是闲时"：否则这条测试会依赖
-  // 跑测试的那一天恰好不是工作日（机器时钟一走，它就会红——踩过）。
-  const { routes, listeners } = boot({ overrides: { [TODAY]: 'off' } }, { settings })
+test('设置：语义校验挂在 internal/config 上 —— 非法配置在写盘前就被拒', () => {
+  const { listeners } = boot({})
+  const handler = (listeners.get('internal/config') ?? [])[0]
+  assert.ok(handler, '必须注册 internal/config 校验器（configEditor.edit 写盘前会跑它）')
+
+  // 非法：时区 / 时段重叠 / 覆盖键不是日期 —— 全部要抛，写入才会被拒。
+  assert.throws(() => handler({ timezone: 'Nowhere/Fake' }, () => 'next'), /IANA 时区/)
+  assert.throws(
+    () => handler({ peakWindows: [['09:00', '12:00'], ['11:00', '13:00']] }, () => 'next'),
+    /重叠/,
+  )
+  assert.throws(() => handler({ overrides: { '2026/10/26': 'off' } }, () => 'next'), /YYYY-MM-DD/)
+
+  // 合法：放行给下游，且返回值必须是下游的返回值（waterfall 语义）。
+  let nextCalled = 0
+  const returned = handler({ leadMinutes: 20 }, () => { nextCalled += 1; return 'downstream' })
+  assert.equal(returned, 'downstream')
+  assert.equal(nextCalled, 1)
+})
+
+test('设置：volatile 热更新就地生效（不重载插件、不重复注册监听器）', async () => {
+  const cfg = refConfig({ enabled: false, overrides: { [TODAY]: 'off' } })
+  const { ctx, routes, listeners } = boot(cfg)
 
   const before = await statusAt(routes, `${TODAY}T10:00:00`)
   assert.equal(before.enabled, false)
-  assert.equal(before.phase, 'off', 'TODAY 覆盖成 off 时不该处于高峰')
+  assert.equal(before.phase, 'off', 'TODAY 被覆盖成 off 时不该处于高峰')
 
-  // 通过设置页打开开关，并把 TODAY 覆盖成全天高峰
-  settings.registrations.get('peak-brief').setUser({
-    enabled: true,
-    gateMode: 'hard',
-    overrides: { [TODAY]: 'peak' },
-    peakWindows: [['00:00', '24:00']],
-  })
+  // 用户在原生设置页保存：只动 volatile 字段 → loader 就地 updateVolatile + 发事件
+  updateVolatile(cfg.enabled, createVolatile(true))
+  updateVolatile(cfg.overrides, createVolatile({ [TODAY]: 'peak' }))
+  updateVolatile(cfg.peakWindows, createVolatile([['00:00', '24:00']]))
+  ctx.emit('loader/volatile-update', [['enabled'], ['overrides'], ['peakWindows']])
 
   const after = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(after.enabled, true, '设置变更必须立刻反映到生效配置')
+  assert.equal(after.enabled, true, 'volatile 变更必须立刻反映到生效配置')
   assert.equal(after.phase, 'peak')
   assert.equal(after.enforcement, 'hard-block')
   assert.deepEqual(after.windows, [{ start: '00:00', end: '24:00' }], '时段必须用新值重建')
 
-  // 而且真的开始拦
+  // 而且真的开始拦（gate 重建成功，不是只有 status 好看）
   const blocked = await runStreamListener(listeners, { provider: 'p', model: 'm', messages: [] })
   assert.equal(blocked.nextCalled, 0)
   assert.equal(blocked.chunks[0].reason.failure.code, GATE_CODE)
 
+  // 没有重载插件：同一个 llm/stream 监听器还在，且只有一份。
+  assert.equal((listeners.get('llm/stream') ?? []).length, 1)
+  assert.equal((listeners.get('loader/volatile-update') ?? []).length, 1)
+
   // 再关掉 → 立刻放行
-  settings.registrations.get('peak-brief').patchUser({ enabled: false })
+  updateVolatile(cfg.enabled, createVolatile(false))
+  ctx.emit('loader/volatile-update', [['enabled']])
   assert.equal((await statusAt(routes, `${TODAY}T10:00:00`)).enabled, false)
   const allowed = await runStreamListener(listeners, { provider: 'p', model: 'm', messages: [] })
   assert.equal(allowed.nextCalled, 1, '关闭之后必须立刻恢复放行')
 })
 
-test('设置：清空用户层会回退到 base，而不是硬回内置默认', async () => {
-  const settings = makeSettings()
-  const { routes } = boot({ leadMinutes: 25, notify: 'off' }, { settings })
-  const record = settings.registrations.get('peak-brief')
-
-  record.patchUser({ leadMinutes: 5 })
-  assert.equal((await statusAt(routes, `${TODAY}T10:00:00`)).leadMinutes, 5)
-
-  record.setUser({})
-  const back = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(back.leadMinutes, 25, '清空后回到 patch 层')
-  assert.equal(back.notify, 'off')
-})
-
-test('设置：非法写入被 schema 拒绝，生效配置保持不变', async () => {
-  const settings = makeSettings()
-  const { routes } = boot({}, { settings })
-  const record = settings.registrations.get('peak-brief')
-
-  // dsh-settings 的写入路径会调用 schema；这里直接验证它确实抛
-  assert.throws(() => record.schema({ leadMinutes: -1 }), /leadMinutes/)
-  assert.throws(() => record.schema({ peakWindows: [['10:00', '09:00']] }), /结束时刻/)
-
-  // 生效配置没被污染
-  const status = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(status.leadMinutes, 10)
-  assert.deepEqual(status.windows, [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }])
-})
-
-test('设置：服务不可用时插件照常工作，并如实报告', async () => {
-  const { routes } = boot({})
-  const status = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(status.settings.registered, false)
-  assert.equal(status.settings.reason, 'settings-service-unavailable')
-  assert.equal(status.enabled, false, '核心功能不受影响')
-})
-
-test('设置：注册失败（例如存了一份非法配置）也不能让插件瘫掉', async () => {
-  const settings = { register() { throw new Error('stored section is invalid') } }
-  const { routes } = boot({ leadMinutes: 12 }, { settings })
+test('设置：volatile 更新若派生物构造失败，保留旧配置而不是带着半套配置跑', async () => {
+  const cfg = refConfig({})
+  const { ctx, routes, logs } = boot(cfg)
+  // 构造一份"schema 挡不住、但 normalizeConfig 会拒绝"的语义坏值（时区不存在）
+  updateVolatile(cfg.timezone, createVolatile('Nowhere/Fake'))
+  ctx.emit('loader/volatile-update', [['timezone']])
 
   const status = await statusAt(routes, `${TODAY}T10:00:00`)
-  assert.equal(status.settings.registered, false)
-  assert.match(status.settings.reason, /register-failed/)
-  assert.equal(status.leadMinutes, 12, '退回 patch 配置继续工作')
+  assert.equal(status.timezone, DEFAULT_CONFIG.timezone, '失败时保留上一份可用配置')
+  assert.ok(logs.some((line) => line.includes('新设置无法应用')), '必须留下 warn，不许静默')
+})
+
+test('设置：（重）加载时接管已经在跑的会话（agent/created 不会再补发）', async () => {
+  const agent = {
+    status: 'idle',
+    session: { id: 'sess-seeded', deriveMessages: () => [MSG], requestHeader: () => null },
+  }
+  const { routes } = boot({ enabled: false }, { agents: { list: () => [agent] } })
+  const status = await statusAt(routes, `${TODAY}T10:00:00`)
+  assert.deepEqual(status.liveSessions, ['sess-seeded'], '已有会话必须被收进 liveAgents')
 })
 
 // ---------------------------------------------------------- 斜杠命令

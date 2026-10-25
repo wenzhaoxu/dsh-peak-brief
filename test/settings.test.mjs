@@ -1,21 +1,42 @@
+/**
+ * 配置契约的测试。
+ *
+ * 两套规则并存，而且分工必须清楚：
+ *   · `createConfigSchema()`（schemastery `Config`）—— 形状与默认值，给
+ *     `SettingsForms` 生成原生设置页、给 `configEditor.edit()` 写盘前校验；
+ *     只有 `.volatile()` 字段会出现在设置页、也只有它们能就地热更新。
+ *   · `normalizeConfig()` —— 语义校验与归一化（IANA 时区、时段重叠、按日覆盖的键、
+ *     同义写法），挂在 `internal/config` waterfall 上，非法写入照样被拒。
+ *
+ * 这两层任何一层松掉，"非法配置存不进去"就不再成立，所以都要钉。
+ */
+
 import test from 'node:test'
 import assert from 'node:assert/strict'
+
+import { createVolatile } from '@deepseek-ai/cosmokit'
 
 import {
   DEFAULT_CONFIG,
   GATE_MODES,
   NOTIFY_MODES,
-  SETTINGS_NAMESPACE,
-  createSettingsSchema,
+  createConfigSchema,
   normalizeConfig,
-  schemaJson,
-  settingsBaseFrom,
+  unwrapConfig,
 } from '../lib/settings.js'
 
-test('命名空间名必须符合 dsh-settings 的 lower-kebab-case 约束', () => {
-  assert.equal(SETTINGS_NAMESPACE, 'peak-brief')
-  assert.match(SETTINGS_NAMESPACE, /^[a-z][a-z0-9-]*$/)
-})
+/** 设置页里可编辑（因而必须是 volatile）的字段。 */
+const EDITABLE = [
+  'enabled',
+  'timezone',
+  'leadMinutes',
+  'peakWindows',
+  'notify',
+  'gateMode',
+  'blockAuxiliary',
+  'resumeBlocked',
+  'overrides',
+]
 
 test('空输入解析成默认值', () => {
   const config = normalizeConfig({})
@@ -89,49 +110,104 @@ test('未知字段被忽略（不因为一个多余字段就让整份配置注�
   assert.equal('未来字段' in config, false)
 })
 
-test('schema 可调用，并且在非法输入上抛错（dsh-settings 的写入路径依赖这一点）', () => {
-  const schema = createSettingsSchema()
-  assert.equal(typeof schema, 'function')
-
-  const resolved = schema({ leadMinutes: 15 })
-  assert.equal(resolved.leadMinutes, 15)
-  assert.equal(resolved.timezone, DEFAULT_CONFIG.timezone, '未提供的字段要用默认值补齐')
-  assert.throws(() => schema({ leadMinutes: -1 }), /leadMinutes/)
-})
-
-test('schema.toJSON 给出配置界面能读懂的结构', () => {
-  const schema = createSettingsSchema()
+test('Config 是 schemastery schema：有 ~standard 与 toJSON，且能 JSON 序列化', () => {
+  const schema = createConfigSchema()
+  assert.equal(schema['~standard'].vendor, 'schemastery')
   assert.equal(typeof schema.toJSON, 'function')
   const json = schema.toJSON()
-  assert.equal(json.type, 'object')
-  assert.equal(json.additionalProperties, false)
-  for (const key of Object.keys(DEFAULT_CONFIG)) {
-    assert.ok(json.properties[key], `schema 必须覆盖 ${key}`)
-  }
-  assert.deepEqual(json.properties.gateMode.enum, GATE_MODES)
-  assert.deepEqual(json.properties.notify.enum, NOTIFY_MODES)
-  // 必须能被 JSON 序列化（要走 Remote 线）
+  // SettingsForms 会 `new z(schema.toJSON())` 重建一份纯数据 schema，再走 Remote 线。
+  assert.equal(typeof json, 'object')
   assert.equal(typeof JSON.stringify(json), 'string')
-  assert.deepEqual(schemaJson().properties.leadMinutes.type, 'number')
 })
 
-test('settingsBaseFrom 只取受设置管辖的字段', () => {
-  const base = settingsBaseFrom({ leadMinutes: 25, 别的插件字段: 'x', enabled: true })
-  assert.deepEqual(base, { leadMinutes: 25, enabled: true })
-  assert.deepEqual(settingsBaseFrom(undefined), {})
-  assert.deepEqual(settingsBaseFrom(null), {})
-  assert.deepEqual(settingsBaseFrom('nope'), {})
+test('模块导出形状：loader 的 unwrapExports(default ?? namespace) 之后仍带着 Config', async () => {
+  const ns = await import('../lib/index.js')
+  // cordis-plugin-loader/lib/index.js: `unwrapExports(exports) => exports.default ?? exports`
+  const plugin = ns.default ?? ns
+  assert.equal(typeof plugin.apply, 'function')
+  assert.equal(plugin.name, 'dsh-peak-brief')
+  assert.ok(plugin.Config, 'default 导出（若存在）必须带上 Config，否则原生设置页不会出现')
+  assert.equal(plugin.Config['~standard'].vendor, 'schemastery')
 })
 
-test('base 层参与解析：清空用户层会回退到 patch 里的值', () => {
-  const schema = createSettingsSchema()
-  const base = settingsBaseFrom({ leadMinutes: 25, timezone: 'UTC' })
-  // 用户层为空 → 解析出 base
-  const inherited = schema({ ...base })
-  assert.equal(inherited.leadMinutes, 25)
-  assert.equal(inherited.timezone, 'UTC')
-  // 用户层覆盖 → 以用户层为准
-  const overridden = schema({ ...base, leadMinutes: 5 })
-  assert.equal(overridden.leadMinutes, 5)
-  assert.equal(overridden.timezone, 'UTC', '没覆盖的字段仍继承 base')
+test('Config 的默认值与 DEFAULT_CONFIG 对齐（设置页打开时不漂移）', () => {
+  const schema = createConfigSchema()
+  const resolved = normalizeConfig(unwrapConfig(schema({})))
+  assert.deepEqual(resolved, DEFAULT_CONFIG)
+})
+
+test('Config：设置页可编辑的字段全部是 volatile，部署参数不是', () => {
+  const schema = createConfigSchema()
+  const volatileKeys = Object.entries(schema.dict)
+    .filter(([, child]) => child.meta?.volatile === true)
+    .map(([key]) => key)
+  assert.deepEqual(volatileKeys.sort(), [...EDITABLE].sort())
+
+  // 非 volatile = 不进设置页、改动会触发插件整体重载；这两块属于部署参数。
+  for (const key of ['brief', 'holidayRefresh']) {
+    assert.notEqual(schema.dict[key].meta?.volatile, true, `${key} 不该进设置页`)
+  }
+  // volatile 不能嵌套（cordis-plugin-loader 的 validateVolatileSchema 会直接抛错）。
+  for (const key of EDITABLE) {
+    const child = schema.dict[key]
+    assert.equal(child.meta.volatile, true, `${key} 必须是 volatile`)
+    for (const [nested, inner] of Object.entries(child.dict ?? {})) {
+      assert.notEqual(inner.meta?.volatile, true, `${key}.${nested} 不能嵌 volatile`)
+    }
+  }
+})
+
+test('Config 校验形状：越界/枚举/类型错误在写盘前就被拒', () => {
+  const schema = createConfigSchema()
+  assert.throws(() => schema({ leadMinutes: -1 }))
+  assert.throws(() => schema({ leadMinutes: 2000 }))
+  assert.throws(() => schema({ notify: 'sms' }))
+  assert.throws(() => schema({ gateMode: 'soft' }))
+  assert.throws(() => schema({ peakWindows: '09:00-12:00' }))
+})
+
+test('Config 不负责语义：时区与时段重叠仍由 normalizeConfig 拦（注释即契约）', () => {
+  const schema = createConfigSchema()
+  // 形状没错 —— schema 放行。
+  const raw = unwrapConfig(schema({ timezone: 'Nowhere/Fake' }))
+  // 语义校验（挂在 internal/config 上）才是第二道闸。
+  assert.throws(() => normalizeConfig(raw), /IANA 时区/)
+  assert.throws(
+    () => normalizeConfig(unwrapConfig(schema({ peakWindows: [['12:00', '09:00']] }))),
+    /结束时刻必须晚于开始时刻/,
+  )
+  // 元组长度也是语义：schemastery 的 tuple 不校验长度，落到 normalizePeakWindows。
+  assert.throws(
+    () => normalizeConfig({ peakWindows: [['09:00']] }),
+    /恰好两个时刻/,
+  )
+  assert.throws(
+    () => normalizeConfig({ peakWindows: [['09:00', '12:00', '14:00']] }),
+    /恰好两个时刻/,
+  )
+})
+
+test('unwrapConfig 摊平 volatile ref（单层 / 嵌套 / 数组），普通对象原样穿过', () => {
+  const ref = createVolatile(7)
+  assert.equal(unwrapConfig(ref), 7)
+
+  const nested = {
+    a: createVolatile('x'),
+    b: [createVolatile(1), { c: createVolatile(true) }],
+    d: null,
+    e: 3,
+  }
+  assert.deepEqual(unwrapConfig(nested), { a: 'x', b: [1, { c: true }], d: null, e: 3 })
+
+  const plain = { enabled: true, peakWindows: [['09:00', '12:00']] }
+  const unwrapped = unwrapConfig(plain)
+  assert.deepEqual(unwrapped, plain)
+  assert.notEqual(unwrapped, plain, '返回的是新对象，调用方改它不会污染 ref')
+})
+
+test('枚举常量与 schema 的枚举保持一致', () => {
+  const schema = createConfigSchema()
+  const list = (key) => schema.dict[key].list.map((item) => item.value)
+  assert.deepEqual(list('notify'), NOTIFY_MODES)
+  assert.deepEqual(list('gateMode'), GATE_MODES)
 })

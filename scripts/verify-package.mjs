@@ -84,6 +84,8 @@ try {
     'cordis.patch.yml',
     'lib/index.js',
     'lib/client.js',
+    'lib/settings.js',
+    'lib/lifecycle.js',
     'lib/holidays.js',
     'scripts/acceptance.mjs',
     'scripts/build-holidays.mjs',
@@ -107,21 +109,56 @@ try {
   const copy = join(extract, 'package')
   step('解包成功', existsSync(join(copy, 'lib', 'index.js')), `副本在 ${copy}`)
 
-  // ---- 4) lib/ 里不许出现 npm 裸导入（零依赖是硬约束） ----
+  // ---- 4) lib/ 里只许出现"相对路径 / node: 内置 / DSH framework seed" ----
+  //
+  // 2026-10-25 起设置面必须导出 schemastery `Config`（cordis loader 用
+  // `schema["~standard"].vendor === 'schemastery'` 判断，`updateVolatile()` 来自
+  // cosmokit），所以这两个 **DSH 给外部宿主插件的 framework seed** 是允许的依赖；
+  // 它们由 profile 的 node_modules 提供（挂载点在 profile 里，向上解析即可）。
+  // 除它们之外仍然不许出现任何 npm 裸导入。
+  const ALLOWED_BARE = new Set(['@deepseek-ai/schemastery', '@deepseek-ai/cosmokit'])
   const libFiles = ['index.js', 'client.js', 'brief.js', 'brief-store.js', 'calendar.js', 'gate.js', 'holidays.js', 'resume.js', 'settings.js', 'tz.js', 'windows.js']
   const bare = []
   for (const file of libFiles) {
     const text = readFileSync(join(copy, 'lib', file), 'utf8')
     for (const match of text.matchAll(/(?:^|\n)\s*import\s[^\n]*?from\s+'([^']+)'/g)) {
       const spec = match[1]
-      if (spec.startsWith('.') !== true && spec.startsWith('node:') !== true) bare.push(`${file} -> ${spec}`)
+      if (spec.startsWith('.') || spec.startsWith('node:') || ALLOWED_BARE.has(spec)) continue
+      bare.push(`${file} -> ${spec}`)
     }
   }
   step(
-    'lib/ 只 import 相对路径与 node: 内置模块',
+    'lib/ 只 import 相对路径、node: 内置模块与 DSH framework seed',
     bare.length === 0,
-    bare.length === 0 ? `${libFiles.length} 个文件检查完毕，无 npm 依赖` : bare.join(', '),
+    bare.length === 0
+      ? `${libFiles.length} 个文件检查完毕，无第三方 npm 依赖`
+      : bare.join(', '),
   )
+
+  // ---- 4.5) 把 DSH framework seed 链进副本 ----
+  //
+  // 解包后的副本在 /tmp 下，向上找不到 profile 的 node_modules；而 ESM 不认
+  // NODE_PATH。所以显式把这两个 seed 软链进副本的 node_modules，
+  // 让"发出去的那份"能在与挂载点相同的解析规则下跑测试。
+  function findSeeds(from) {
+    let dir = from
+    for (let i = 0; i < 12; i += 1) {
+      const candidate = join(dir, 'node_modules', '@deepseek-ai')
+      if (['schemastery', 'cosmokit'].every((name) => existsSync(join(candidate, name, 'package.json')))) return candidate
+      const parent = join(dir, '..')
+      if (parent === dir) break
+      dir = parent
+    }
+    return undefined
+  }
+  const seeds = findSeeds(ROOT) ?? findSeeds(process.cwd())
+  if (seeds === undefined) {
+    step('找到 DSH framework seed（schemastery / cosmokit）', false, '副本里没法解析 Config 依赖')
+    throw new Error('framework seeds not found')
+  }
+  const seedTarget = join(copy, 'node_modules', '@deepseek-ai')
+  const link = run(`mkdir -p "${seedTarget}" && ln -sfn "${join(seeds, 'schemastery')}" "${join(seedTarget, 'schemastery')}" && ln -sfn "${join(seeds, 'cosmokit')}" "${join(seedTarget, 'cosmokit')}"`)
+  step('把 DSH framework seed 链进副本', link.ok === true, link.ok === true ? seeds : (link.err || '').trim())
 
   // ---- 5) 在副本里跑完整测试 ----
   const tests = run('node --test', { cwd: copy })

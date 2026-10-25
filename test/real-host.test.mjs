@@ -14,10 +14,13 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
+import z from '@deepseek-ai/schemastery'
 
 import * as plugin from '../lib/index.js'
 
@@ -43,16 +46,12 @@ const RUNTIME = process.env.DSH_RUNTIME ?? firstExistingRuntime([
 const NODE_MODULES = join(RUNTIME, 'node_modules', '@deepseek-ai')
 const CORDIS = join(NODE_MODULES, 'cordis', 'lib', 'index.js')
 const LLM = join(NODE_MODULES, 'dsh-llm', 'lib', 'index.js')
-const SETTINGS_FILE = join(NODE_MODULES, 'dsh-settings-file', 'lib', 'index.js')
 
 const available = existsSync(CORDIS) && existsSync(LLM)
 const skip = available ? false : `找不到 DSH 运行时（${RUNTIME}）；设 DSH_RUNTIME 指向它`
-const settingsAvailable = existsSync(SETTINGS_FILE)
-const settingsSkip = settingsAvailable ? false : `找不到 dsh-settings-file（${SETTINGS_FILE}）`
 
 const { Context } = available ? await import(pathToFileURL(CORDIS).href) : {}
 const llmModule = available ? await import(pathToFileURL(LLM).href) : {}
-const settingsModule = settingsAvailable ? await import(pathToFileURL(SETTINGS_FILE).href) : {}
 
 /**
  * 只实现 `stream` 的桩适配器：LlmAdapter 的其余成员都有默认实现。
@@ -92,7 +91,7 @@ function shanghaiToday() {
 const TODAY = shanghaiToday()
 
 /** 搭一个真实宿主：真 cordis、真 LlmRuntime、真 webServer.register。 */
-async function buildHost(config, { settingsPath = null } = {}) {
+async function buildHost(config) {
   const ctx = new Context()
   const runtime = new llmModule.LlmRuntime(ctx)
   const adapter = new StubAdapter()
@@ -112,13 +111,14 @@ async function buildHost(config, { settingsPath = null } = {}) {
   ctx.provide('sessions', {})
   ctx.provide('webServer', webServer)
 
-  // 真实 settings 服务（文件后端）。必须在插件之前就位，否则 apply 时拿不到 ctx.settings。
-  if (settingsPath !== null && settingsAvailable) {
-    ctx.plugin(settingsModule.FileSettingsProvider, { path: settingsPath, watch: false })
-    await new Promise((resolve) => { setTimeout(resolve, 80) })
-  }
-
-  const fork = ctx.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply }, config)
+  // 真实装载形态：模块对象里的 `Config` 必须一起交给 cordis，否则
+  // resolveConfig() 不会把 volatile 字段换成 Ref，设置页也就没有可编辑字段。
+  const fork = ctx.plugin({
+    name: plugin.name,
+    inject: plugin.inject,
+    apply: plugin.apply,
+    Config: plugin.Config,
+  }, config)
   // 等 inject 满足后 apply 被真正调用
   await new Promise((resolve) => { setTimeout(resolve, 60) })
 
@@ -146,7 +146,7 @@ async function buildHost(config, { settingsPath = null } = {}) {
     return out
   }
 
-  return { ctx, fork, runtime, adapter, routes, call, stream, settings: ctx.settings ?? null }
+  return { ctx, fork, runtime, adapter, routes, call, stream }
 }
 
 /** 把真实运行时的时钟推到某个瞬间，再跑一次 tick（插件自带的调试接口）。 */
@@ -376,98 +376,150 @@ test('真实宿主：插件卸载后路由与 waterfall 监听一并拆除', { s
   assert.equal(host.adapter.calls, 1)
 })
 
-// ------------------------------------------------- 真实 settings 服务（文件后端）
+// ------------------------------------ 真实 cordis 下的 Config / volatile 热更新
+//
+// 设置面在 2026-10-25 换成了 DSH 的新 API：插件导出 schemastery `Config`，
+// `SettingsForms` 据此生成原生设置页；只有 `.volatile()` 字段可编辑，改动由
+// cordis loader 就地 updateVolatile 并 emit `loader/volatile-update`（不重载插件）。
+// 这一组用**真实 cordis** 验证这条链路的三个关键点。
 
-function tempSettingsFile(section) {
-  const dir = mkdtempSync(join(tmpdir(), 'peak-settings-'))
-  const file = join(dir, 'settings.json')
-  writeFileSync(file, JSON.stringify(section ?? {}), 'utf8')
-  return { dir, file }
-}
+test('真实宿主：Config 被 cordis 解析成 ref（volatile），非 volatile 保持普通值', { skip }, async () => {
+  const host = await buildHost({ leadMinutes: 17 })
 
-test('真实设置服务：手写的"类 schema"能被官方 FileSettingsProvider 接受', { skip: settingsSkip }, async () => {
-  const { dir, file } = tempSettingsFile({ 'peak-brief': { leadMinutes: 42, timezone: 'UTC' } })
+  const config = host.fork.config
+  assert.equal(typeof config.leadMinutes.get, 'function', 'volatile 字段在 apply 里应当是 Ref')
+  assert.equal(config.leadMinutes.get(), 17)
+  assert.equal(config.timezone.get(), 'Asia/Shanghai', '默认值来自 schema')
+  // 非 volatile：普通值。改它会让插件整体重载，所以不进设置页。
+  assert.equal(typeof config.brief, 'object')
+  assert.notEqual(typeof config.brief.get, 'function')
+})
+
+test('真实宿主：volatile 更新就地生效（真的开始拦，且不重载插件）', { skip }, async () => {
+  const host = await buildHost({})
+  assert.equal((await host.stream()).at(-1).reason.kind, 'stop', '默认关闭时放行')
+
+  // 模拟 loader `_commitVolatile()`：就地更新 ref，然后广播事件。
+  const callsBefore = host.adapter.calls
+  updateVolatile(host.fork.config.enabled, createVolatile(true))
+  updateVolatile(host.fork.config.overrides, createVolatile({ [TODAY]: 'peak' }))
+  updateVolatile(host.fork.config.peakWindows, createVolatile([['00:00', '24:00']]))
+  host.fork.ctx.emit('loader/volatile-update', [['enabled'], ['overrides'], ['peakWindows']])
+
+  const state = (await host.call('/api/peak-brief.state')).json.state
+  assert.equal(state.status.enabled, true, 'volatile 变更必须立刻反映到生效配置')
+  assert.equal(state.status.phase, 'peak')
+  assert.equal(state.status.enforcement, 'hard-block')
+
+  const blocked = await host.stream()
+  assert.equal(blocked.at(-1).reason.kind, 'error', '更新后必须真的开始拦截')
+  assert.equal(host.adapter.calls, callsBefore, '拦截时适配器一次都不该被调用')
+
+  // 没有重载：重复 apply 会在同一批路由上重复注册并直接抛错，所以路由数不变即证据之一。
+  assert.equal(host.routes.size, 10)
+
+  // 再关掉 → 立刻放行
+  updateVolatile(host.fork.config.enabled, createVolatile(false))
+  host.fork.ctx.emit('loader/volatile-update', [['enabled']])
+  assert.equal((await host.stream()).at(-1).reason.kind, 'stop')
+})
+
+test('真实宿主：internal/config waterfall 上做语义校验（写盘前最后一道闸）', { skip }, async () => {
+  const host = await buildHost({})
+  const run = (raw) => host.fork.ctx.waterfall(host.fork, 'internal/config', raw, () => 'next')
+
+  // configEditor.edit() 在写 profile patch **之前**会跑这条 waterfall。
+  assert.throws(() => run({ timezone: 'Nowhere/Fake' }), /IANA 时区/)
+  assert.throws(() => run({ peakWindows: [['09:00', '12:00'], ['11:00', '13:00']] }), /重叠/)
+  assert.throws(() => run({ overrides: { '2026/10/26': 'off' } }), /YYYY-MM-DD/)
+  assert.equal(run({ leadMinutes: 20, timezone: 'UTC' }), 'next', '合法配置必须放行给下游')
+})
+
+/**
+ * 真实 `SettingsForms`（dsh-settings 的服务本体）读我们的 `Config` 时会投影出什么。
+ *
+ * 这是整套新 API 里"最后一公里"的一环：`describe()` 决定原生设置页显示哪些字段、
+ * 用哪份值。它需要 `configEditor` / `profileContext` 两个服务，这里用最小的假实现
+ * 顶上——`describe()` 只读它们的 `configuration()` / `home`，不写任何东西。
+ */
+test('真实 SettingsForms：describe() 把 Config 投影成 9 个可编辑字段（原生设置页会出现）', { skip }, async () => {
+  const SETTINGS_MODULE = join(NODE_MODULES, 'dsh-settings', 'lib', 'index.js')
+  if (existsSync(SETTINGS_MODULE) !== true) {
+    assert.ok(true, '本机没有 dsh-settings，跳过')
+    return
+  }
+  const { SettingsForms } = await import(pathToFileURL(SETTINGS_MODULE).href)
+  const home = mkdtempSync(join(tmpdir(), 'peak-forms-'))
   try {
-    const host = await buildHost({}, { settingsPath: file })
-    assert.ok(host.settings, '必须真的拿到 ctx.settings')
+    const ctx = new Context()
+    // 构造器里会 `ctx.root.loader.await()`；这是唯一需要顶上的 loader 面。
+    ctx.root.loader = { await: async () => {} }
+    const resolve = (raw) => {
+      const result = plugin.Config['~standard'].validate(raw)
+      if (result.issues) throw new Error(JSON.stringify(result.issues))
+      return result.value
+    }
+    const entry = {
+      id: 'peak-brief',
+      options: { id: 'peak-brief', name: '/x/lib/index.js', config: {} },
+      fiber: {
+        uid: 1,
+        state: 2,
+        runtime: { Config: plugin.Config },
+        config: resolve({ leadMinutes: 12 }),
+        ctx,
+        entry: { options: { id: 'peak-brief' } },
+      },
+    }
+    ctx.provide('configEditor', { configuration: () => [{ entry, inherited: {}, override: {} }] })
+    ctx.provide('profileContext', { home, dir: home, patchPath: join(home, 'cordis.patch.yml') })
 
-    // describe() 会调用我们 schema 的 toJSON()——形状不对这里就会炸
-    const described = host.settings.describe()
-    const descriptor = described.find((d) => d.ns === 'peak-brief')
-    assert.ok(descriptor, 'describe() 必须列出 peak-brief 命名空间')
-    assert.equal(descriptor.schema.type, 'object')
-    assert.equal(descriptor.schema.additionalProperties, false)
+    const forms = new SettingsForms(ctx)
+    await new Promise((ready) => { setTimeout(ready, 20) })
+    const descriptor = forms.describe().find((row) => row.ns === 'peak-brief')
 
-    // 解析顺序：schema 默认 → base → 用户层。用户层里的 42 必须生效。
-    assert.equal(descriptor.value.leadMinutes, 42)
-    assert.equal(descriptor.value.timezone, 'UTC')
-    assert.equal(descriptor.value.enabled, false, '未覆盖的字段走 schema 默认')
-
-    // 插件确实注册上了，并把解析结果作为生效配置
-    const state = (await host.call('/api/peak-brief.state')).json.state
-    assert.equal(state.status.settings.registered, true)
-    assert.equal(state.status.leadMinutes, 42)
-    assert.equal(state.config.timezone, 'UTC')
+    assert.ok(descriptor, '原生设置页必须列出 peak-brief（否则这一页永远不会出现）')
+    assert.equal(descriptor.applies, 'live')
+    assert.equal(descriptor.autoGenerate, true)
+    // schema 是"只有 volatile 子集"的投影
+    const form = z(descriptor.schema)
+    assert.deepEqual(Object.keys(form.dict).sort(), [
+      'blockAuxiliary',
+      'enabled',
+      'gateMode',
+      'leadMinutes',
+      'notify',
+      'overrides',
+      'peakWindows',
+      'resumeBlocked',
+      'timezone',
+    ])
+    // 生效值来自 fiber.config（未覆盖的字段走 schema 默认）
+    assert.equal(descriptor.value.leadMinutes, 12)
+    assert.equal(descriptor.value.enabled, false)
+    assert.deepEqual(descriptor.value.peakWindows, [['09:00', '12:00'], ['14:00', '18:00']])
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
   }
 })
 
-test('真实设置服务：写入即时生效，无需重启', { skip: settingsSkip }, async () => {
-  const { dir, file } = tempSettingsFile({})
-  try {
-    const host = await buildHost({}, { settingsPath: file })
-
-    const before = (await host.call('/api/peak-brief.state')).json.state
-    assert.equal(before.status.enabled, false)
-    assert.equal((await host.stream()).at(-1).reason.kind, 'stop')
-
-    // 通过真实 provider 写入用户层
-    await host.settings.update('peak-brief', {
-      enabled: true,
-      gateMode: 'hard',
-      overrides: { [TODAY]: 'peak' },
-      peakWindows: [['00:00', '24:00']],
-    })
-
-    const after = (await host.call('/api/peak-brief.state')).json.state
-    assert.equal(after.status.enabled, true, '设置写入必须即时反映到生效配置')
-    assert.equal(after.status.phase, 'peak')
-
-    const callsBefore = host.adapter.calls
-    const blocked = await host.stream()
-    assert.equal(blocked.at(-1).reason.kind, 'error', '写入后必须真的开始拦截')
-    assert.equal(host.adapter.calls, callsBefore, '拦截时适配器调用次数不得增加')
-
-    // 清空用户层 → 回退到 schema 默认（关闭），并恢复放行
-    await host.settings.replace('peak-brief', {})
-    const back = (await host.call('/api/peak-brief.state')).json.state
-    assert.equal(back.status.enabled, false)
-    assert.equal((await host.stream()).at(-1).reason.kind, 'stop', '清空设置后必须恢复放行')
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('真实设置服务：非法写入被拒，生效配置保持不变', { skip: settingsSkip }, async () => {
-  const { dir, file } = tempSettingsFile({})
-  try {
-    const host = await buildHost({ leadMinutes: 17 }, { settingsPath: file })
-    assert.equal((await host.call('/api/peak-brief.state')).json.state.status.leadMinutes, 17)
-
-    // 每一种非法值都必须被真实 provider 的写入路径拒绝（因为它会调用我们的 schema）
-    await assert.rejects(host.settings.update('peak-brief', { leadMinutes: -1 }), /leadMinutes/)
-    await assert.rejects(host.settings.update('peak-brief', { timezone: 'Nowhere/Fake' }), /IANA 时区/)
-    await assert.rejects(host.settings.update('peak-brief', { gateMode: '瞎写' }), /gateMode/)
-    await assert.rejects(
-      host.settings.update('peak-brief', { peakWindows: [['09:00', '12:00'], ['11:00', '13:00']] }),
-      /重叠/,
-    )
-
-    const after = (await host.call('/api/peak-brief.state')).json.state
-    assert.equal(after.status.leadMinutes, 17, '被拒的写入绝不能污染生效配置')
-    assert.deepEqual(after.config.peakWindows, [['09:00', '12:00'], ['14:00', '18:00']])
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('真实宿主：Config 满足 SettingsForms 契约（volatile 字段集 + toJSON round-trip）', { skip }, async () => {
+  const schema = plugin.Config
+  assert.equal(schema['~standard'].vendor, 'schemastery')
+  const volatileKeys = Object.entries(schema.dict)
+    .filter(([, child]) => child.meta?.volatile === true)
+    .map(([key]) => key)
+  assert.deepEqual(volatileKeys.sort(), [
+    'blockAuxiliary',
+    'enabled',
+    'gateMode',
+    'leadMinutes',
+    'notify',
+    'overrides',
+    'peakWindows',
+    'resumeBlocked',
+    'timezone',
+  ])
+  // SettingsForms 的 plainSchema() 会 `new z(schema.toJSON())` 重建一份纯数据 schema。
+  assert.doesNotThrow(() => new z(schema.toJSON()))
 })

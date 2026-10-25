@@ -3,10 +3,10 @@
  *
  * lib/client.js 是**免构建的经典脚本**，通过 `window.__ModuleLoader__.load` 注册工厂。
  * 这里用 `vm` + 最小 React/DOM shim 把它真的跑起来（本机 dsh-chat-forward 用的同一套
- * 手法），验证两处 UI：
+ * 手法），验证唯一的 UI：`shell.overlay` 里那条可关闭的提示横幅。
  *
- *   shell.overlay      —— 可关闭的提示横幅
- *   settings.section   —— 「设置 → 峰谷调度」整页配置界面
+ * 设置页自 2026-10-25 起由 DSH 原生 `SettingsForms` 生成（Host 导出 `Config`），
+ * 客户端不再注册 `settings.section`，也不再绑 `settingsScope`。
  */
 
 import test from 'node:test'
@@ -102,8 +102,6 @@ function textOf(node) {
   return parts.join(' ')
 }
 
-const byField = (tree, key) => collect(tree).find((n) => n.props?.['data-peak-brief-field'] === key)
-const byAction = (tree, action) => collect(tree).find((n) => n.props?.['data-peak-brief-action'] === action)
 
 /**
  * 跨 realm 归一化：vm 里造出来的数组/对象原型与宿主 realm 不同，
@@ -173,60 +171,20 @@ function loadBundle({ requireOverrides } = {}) {
   }
 }
 
-/** 假 settings 作用域，记录每一次写入。 */
-function makeScope(value) {
-  const calls = { mutate: [], set: [], unset: [] }
-  const listeners = new Set()
-  let snapshot = {
-    status: 'ready',
-    value,
-    base: {},
-    user: {},
-    revision: 3,
-    writable: true,
-    mode: 'host',
-  }
-  return {
-    calls,
-    getSnapshot: () => snapshot,
-    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
-    set: async (field, next) => { calls.set.push({ field, value: next }) },
-    unset: async (field) => { calls.unset.push(field) },
-    mutate: async (ops, revision) => { calls.mutate.push({ ops, revision }) },
-    setSnapshot(next) {
-      snapshot = { ...snapshot, ...next }
-      for (const listener of listeners) listener()
-    },
-  }
-}
-
-const SETTINGS_VALUE = {
-  enabled: false,
-  timezone: 'Asia/Shanghai',
-  leadMinutes: 10,
-  peakWindows: [['09:00', '12:00'], ['14:00', '18:00']],
-  notify: 'popup',
-  gateMode: 'hard',
-  blockAuxiliary: true,
-  resumeBlocked: true,
-  overrides: { '2027-01-01': 'off' },
-}
-
 /**
  * 装载模块并注册槽位。
- * @param options.withSettings - 是否提供 settingsScope（false 用于验证降级）
- * @param options.viaGet       - true 时只在 ctx.get('settingsScope') 上提供（验证回退路径）
- * @param options.slotsLate    - true 时一开始拿不到 slots（复现"服务注册竞态"），
- *                               需手动调用返回的 releaseSlots() 让它到位
+ *
+ * 客户端只剩 `shell.overlay` 一处 UI：设置页已交给 DSH 原生 `SettingsForms`
+ * （Host 导出 `Config`），客户端不再绑 `settingsScope`。
+ *
+ * @param options.slotsLate - true 时一开始拿不到 slots（复现"服务注册竞态"），
+ *                            需手动调用返回的 releaseSlots() 让它到位
  */
-function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMethod = false, slotsLate = false } = {}) {
+function mount(harness, { slotsLate = false } = {}) {
   const registrations = []
   const slots = {
     inject(name, callback) {
-      assert.ok(
-        name === 'shell.overlay' || name === 'settings.section',
-        `注册到了意料之外的槽位：${name}`,
-      )
+      assert.equal(name, 'shell.overlay', `注册到了意料之外的槽位：${name}`)
       return callback()
     },
     register(options, component) {
@@ -235,78 +193,30 @@ function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMe
     },
   }
 
-  const scope = makeScope(SETTINGS_VALUE)
-  const bound = []
-  const settingsScope = {
-    bind(spec) {
-      if (bindThrows === true) throw new Error('命名空间不合法')
-      bound.push(spec)
-      return scope
-    },
-  }
-
-  const reachable = settingsVia === 'inject' || settingsVia === 'get'
   let slotsReady = slotsLate !== true
   const ctx = {
     get(key) {
       if (key === 'slots') return slotsReady ? slots : undefined
-      if (key === 'settingsScope' && reachable) return settingsScope
       return undefined
     },
     effect(fn) { return fn() },
   }
 
-  // 真实 cordis：未在插件 inject 里声明的服务，**属性访问会抛**
-  // （"cannot get property … without inject"）。之前这里直接挂了个普通属性，
-  // 于是测试给了假阳性——这正是线上设置页没挂上而测试全绿的原因。
-  Object.defineProperty(ctx, 'settingsScope', {
-    get() { throw new Error('cannot get property "settingsScope" without inject') },
-    configurable: true,
-  })
-
-  if (noInjectMethod !== true) {
-    ctx.inject = (deps, callback) => {
-      if (settingsVia === 'inject' && deps.includes('settingsScope')) {
-        callback({
-          settingsScope,
-          get: ctx.get,
-          effect: ctx.effect,
-        })
-      }
-      return { dispose() {} }
-    }
-  }
-
   harness.mod.apply(ctx)
 
-  const section = registrations.find((r) => r.options.name === 'settings.section')
   const overlay = registrations.find((r) => r.options.name === 'shell.overlay')
 
   return {
     registrations,
     overlay,
-    section,
-    scope,
-    bound,
     /** 让迟到的 slots 到位（配合 slotsLate 使用）。 */
     releaseSlots() { slotsReady = true },
-    /** 渲染任意注册组件；`extra` 会合进 props（settings.section 的 owner 会传 close）。 */
+    /** 渲染注册组件；`extra` 会合进 props。 */
     render(component, extra = {}) {
       harness.hooks.reset()
       return expand(harness.hooks.React.createElement(component, extra))
     },
-    /** 渲染设置页，自动带上 inject 提供的业务 props。 */
-    renderSettings(extra = {}) {
-      const props = section === undefined ? {} : section.options.inject()
-      return this.render(section.component, { ...props, ...extra })
-    },
   }
-}
-
-/** 触发客户端为"inject 回调没来"准备的那次延迟兜底检查。 */
-function runFallbackTimers(harness) {
-  for (const timer of harness.timers.filter((t) => t.interval !== true)) timer.fn()
-  harness.timers.length = 0
 }
 
 /** 客户端写回 Host 的全部诊断文本（走 /api/peak-brief.hello）。 */
@@ -337,7 +247,6 @@ const flush = async () => {
 /** 渲染 → 跑 effect → 等轮询回来。 */
 async function mountAndSettle(harness, options) {
   const mounted = mount(harness, options)
-  mounted.renderSettings()
   runEffects(harness.hooks.effects)
   await flush()
   return mounted
@@ -363,22 +272,14 @@ test('client：factory 只请求平台 seed 模块（无构建产物依赖）', 
   assert.equal(typeof mod.apply, 'function')
 })
 
-test('client：两处槽位都注册（浮层 + 设置页），不会注册完一个就 return', () => {
+test('client：只注册 shell.overlay 一处 UI（设置页已交给原生 SettingsForms）', () => {
   const harness = loadBundle()
   const mounted = mount(harness)
 
-  assert.equal(mounted.registrations.length, 2, '必须同时挂上浮层与设置页')
+  assert.equal(mounted.registrations.length, 1, '不再注册 settings.section')
   assert.equal(mounted.overlay.options.id, 'dsh-peak-brief')
   assert.equal(typeof mounted.overlay.options.order, 'number')
   assert.equal(typeof mounted.overlay.component, 'function')
-
-  assert.equal(mounted.section.options.id, 'dsh-peak-brief')
-  assert.equal(typeof mounted.section.options.order, 'number')
-  assert.equal(typeof mounted.section.options.label, 'function')
-  assert.equal(mounted.section.options.label(), '峰谷调度')
-  assert.equal(typeof mounted.section.component, 'function')
-  assert.equal(mounted.bound.length, 1)
-  assert.equal(mounted.bound[0].namespace, 'peak-brief', '必须绑定 Host 的 peak-brief 命名空间')
 })
 
 test('client：slots 迟到（服务注册竞态）时轮询补挂，而不是整段跳过', () => {
@@ -397,9 +298,9 @@ test('client：slots 迟到（服务注册竞态）时轮询补挂，而不是�
   tick.fn()
 
   assert.deepEqual(
-    mounted.registrations.map((r) => r.options.name).sort(),
-    ['settings.section', 'shell.overlay'],
-    'slots 到位后两处槽位都要补挂上',
+    mounted.registrations.map((r) => r.options.name),
+    ['shell.overlay'],
+    'slots 到位后浮层要补挂上',
   )
   assert.ok(diagnostics(harness).some((t) => t.includes('slots 迟到')), '补挂要如实上报')
 })
@@ -551,227 +452,10 @@ test('client：React 不可用时降级为"只报错、不崩"', () => {
   assert.match(errors[0], /react/)
 })
 
-// ------------------------------------------------------------------ 设置页
-
-test('设置页：渲染出全部字段与当前值', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-  const tree = mounted.renderSettings()
-
-  const text = textOf(tree)
-  for (const label of ['启用峰谷调度', '提前量（分钟）', '时区', '高峰时段', '高峰拦截', '连辅助请求一起拦', '被拦对话在谷期自动续跑', '提示方式', '按日手动覆盖']) {
-    assert.ok(text.includes(label), `缺少字段：${label}`)
-  }
-
-  assert.equal(byField(tree, 'leadMinutes').props.value, '10')
-  assert.equal(byField(tree, 'timezone').props.value, 'Asia/Shanghai')
-  assert.equal(byField(tree, 'enabled').props.checked, false)
-  assert.equal(byField(tree, 'gateMode').props.value, 'hard')
-  assert.equal(byField(tree, 'notify').props.value, 'popup')
-  assert.equal(byField(tree, 'blockAuxiliary').props.checked, true)
-  assert.equal(byField(tree, 'resumeBlocked').props.checked, true, 'P6：谷期自动续跑的开关要在设置页里')
-  assert.equal(byField(tree, 'peakWindows').props.value, '09:00-12:00\n14:00-18:00')
-  assert.equal(JSON.parse(byField(tree, 'overrides').props.value)['2027-01-01'], 'off')
-
-  // 运行状态条 + 三个操作按钮
-  assert.ok(collect(tree).some((n) => n.props?.['data-peak-brief'] === 'settings-status'))
-  assert.ok(byAction(tree, 'save'))
-  assert.ok(byAction(tree, 'reset'))
-  assert.ok(byAction(tree, 'close'))
-})
-
-test('设置页：改动后保存，写出正确的路径操作与 revision', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-
-  // 勾选启用、改提前量、改时段
-  byField(mounted.renderSettings(), 'enabled').props.onChange({ target: { checked: true } })
-  byField(mounted.renderSettings(), 'leadMinutes').props.onChange({ target: { value: '20' } })
-  byField(mounted.renderSettings(), 'peakWindows').props.onChange({ target: { value: '08:30-11:30\n13:30-17:30' } })
-  byField(mounted.renderSettings(), 'overrides').props.onChange({ target: { value: '{"2027-05-01":"off"}' } })
-
-  byAction(mounted.renderSettings(), 'save').props.onClick()
-  await flush()
-
-  assert.equal(mounted.scope.calls.mutate.length, 1, '一次保存应当只写一次')
-  const { ops, revision } = mounted.scope.calls.mutate[0]
-  assert.equal(revision, 3, '必须带上读到的 revision 作为乐观锁')
-
-  const byPath = Object.fromEntries(ops.filter((op) => op.op === 'set').map((op) => [op.path[0], op.value]))
-  assert.equal(byPath.enabled, true)
-  assert.equal(byPath.leadMinutes, 20, '数字字段必须是数字而不是字符串')
-  assert.deepEqual(plain(byPath.peakWindows), [['08:30', '11:30'], ['13:30', '17:30']])
-  assert.deepEqual(plain(byPath.overrides), { '2027-05-01': 'off' })
-  assert.equal(byPath.timezone, 'Asia/Shanghai', '没改的字段也要一起写（保持整份一致）')
-
-  const after = mounted.renderSettings()
-  assert.ok(collect(after).some((n) => n.props?.['data-peak-brief'] === 'settings-saved'), '保存成功要有反馈')
-})
-
-test('设置页：非法输入不写盘，并给出可读错误', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-
-  byField(mounted.renderSettings(), 'peakWindows').props.onChange({ target: { value: '今天下午' } })
-  byAction(mounted.renderSettings(), 'save').props.onClick()
-  await flush()
-
-  assert.equal(mounted.scope.calls.mutate.length, 0, '解析失败绝不能写盘')
-
-  const tree = mounted.renderSettings()
-  const error = collect(tree).find((n) => n.props?.['data-peak-brief'] === 'settings-error')
-  assert.ok(error, '必须显示错误')
-  assert.match(textOf(error), /无法解析时段/)
-})
-
-test('设置页：非法 JSON 覆盖同样被拦住', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-
-  byField(mounted.renderSettings(), 'overrides').props.onChange({ target: { value: '[1,2,3]' } })
-  byAction(mounted.renderSettings(), 'save').props.onClick()
-  await flush()
-
-  assert.equal(mounted.scope.calls.mutate.length, 0)
-  const error = collect(mounted.renderSettings()).find((n) => n.props?.['data-peak-brief'] === 'settings-error')
-  assert.match(textOf(error), /必须是 JSON 对象/)
-})
-
-test('设置页：恢复默认 = unset 全部字段，让它们回退到 patch 层', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-
-  byAction(mounted.renderSettings(), 'reset').props.onClick()
-  await flush()
-
-  assert.equal(mounted.scope.calls.mutate.length, 1)
-  const { ops, revision } = mounted.scope.calls.mutate[0]
-  assert.equal(revision, 3)
-  assert.ok(ops.length > 0)
-  assert.ok(ops.every((op) => op.op === 'unset'), '恢复默认只能靠 unset（清空用户层）')
-  assert.ok(ops.some((op) => op.path[0] === 'leadMinutes'))
-})
-
-test('设置页：写入被 Host 拒绝时展示原因，不假装成功', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-  mounted.scope.mutate = async () => { throw new Error('leadMinutes 必须是非负整数') }
-
-  byAction(mounted.renderSettings(), 'save').props.onClick()
-  await flush()
-
-  const tree = mounted.renderSettings()
-  const error = collect(tree).find((n) => n.props?.['data-peak-brief'] === 'settings-error')
-  assert.ok(error)
-  assert.match(textOf(error), /必须是非负整数/)
-  assert.equal(collect(tree).some((n) => n.props?.['data-peak-brief'] === 'settings-saved'), false)
-})
-
-test('设置页：命名空间不可用时只读，不提供保存', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-  mounted.scope.setSnapshot({ status: 'unavailable', value: undefined, writable: false })
-
-  const tree = mounted.renderSettings()
-  assert.equal(byAction(tree, 'save').props.disabled, true)
-  assert.equal(byAction(tree, 'reset').props.disabled, true)
-  assert.match(textOf(tree), /没有暴露 peak-brief 设置命名空间/)
-})
-
-test('设置页：关闭按钮调用 owner 给的 close()', async () => {
-  const harness = loadBundle()
-  const mounted = await mountAndSettle(harness)
-
-  let closed = 0
-  byAction(mounted.renderSettings({ close: () => { closed += 1 } }), 'close').props.onClick()
-  assert.equal(closed, 1)
-})
-
-test('设置页：settingsScope 完全不可用时，浮层照常挂 + 自报原因（不再静默）', async () => {
-  const harness = loadBundle()
-  const errors = []
-  const originalError = console.error
-  console.error = (message) => errors.push(String(message))
-
-  let mounted
-  try {
-    mounted = mount(harness, { settingsVia: 'none' })
-    assert.equal(mounted.registrations.length, 1, '只应挂上浮层')
-    assert.equal(mounted.registrations[0].options.name, 'shell.overlay')
-
-    // inject 回调没触发 → 跑一次延迟兜底，必须自报（console.error 仍处于接管状态）
-    runFallbackTimers(harness)
-    await flush()
-  } finally {
-    console.error = originalError
-  }
-
-  assert.equal(errors.length, 1)
-  assert.match(errors[0], /设置页未挂载/)
-  assert.match(lastDiagnostic(harness), /settingsScope/, '必须把确切原因写回 Host 供后端读取')
-})
-
-test('设置页：只有 ctx.get 可用（无 ctx.inject）时走回退路径', () => {
-  const harness = loadBundle()
-  const mounted = mount(harness, { settingsVia: 'get', noInjectMethod: true })
-  assert.equal(mounted.registrations.length, 2)
-  assert.equal(mounted.bound.length, 1)
-  assert.equal(mounted.bound[0].namespace, 'peak-brief')
-})
-
-test('设置页：bind 抛错时自报，浮层不受影响', async () => {
-  const harness = loadBundle()
-  const errors = []
-  const originalError = console.error
-  console.error = (message) => errors.push(String(message))
-
-  let mounted
-  try {
-    mounted = mount(harness, { bindThrows: true })
-  } finally {
-    console.error = originalError
-  }
-
-  assert.equal(mounted.registrations.length, 1)
-  assert.equal(mounted.registrations[0].options.name, 'shell.overlay')
-
-  await flush()
-  assert.equal(errors.length, 1)
-  assert.match(errors[0], /bind 失败/)
-  assert.match(lastDiagnostic(harness), /bind 失败/)
-})
-
-test('设置页：挂载成功时也会写回诊断（后端可据此确认浏览器真的挂上了）', () => {
-  const harness = loadBundle()
-  const mounted = mount(harness)
-  assert.equal(mounted.registrations.length, 2)
-
-  const notes = diagnostics(harness)
-  assert.ok(notes.some((t) => t.includes('client apply 已执行')), '第一件事就上报 apply 已执行')
-  assert.ok(notes.some((t) => t.includes('已提交注册')), '提交注册要上报')
-  // 确定信号：注册回调真的跑了、登记进台账了。真实环境里 slots.inject 是延迟执行的，
-  // 所以这条会在"已提交注册"之后才出现；测试里的假 slots 是同步回调，故顺序相反，
-  // 这里只断言两条都存在。
-  assert.ok(
-    notes.some((t) => t.includes('settings-section 终态：') && t.includes('where=inject') && t.includes('registered=是')),
-    '必须上报"注册成功"这条确定信号',
-  )
-})
-
-test('设置页：走 ctx.get 回退成功时，诊断里标明是 get 路径', () => {
-  const harness = loadBundle()
-  mount(harness, { settingsVia: 'get', noInjectMethod: true })
-  const notes = diagnostics(harness)
-  assert.ok(
-    notes.some((t) => t.includes('settings-section 终态：') && t.includes('where=get') && t.includes('registered=是')),
-  )
-})
-
-test('client：Host 没起来时两个 UI 都不崩', async () => {
+test('client：Host 没起来时浮层不崩（轮询失败只是不显示）', async () => {
   const harness = loadBundle()
   harness.setResponder(async () => { throw new Error('Host 还没起来') })
 
   const mounted = await mountAndSettle(harness)
   assert.equal(mounted.render(mounted.overlay.component, {}), null)
-  assert.ok(mounted.renderSettings(), '设置页应当仍然渲染（只是状态读不到）')
 })
