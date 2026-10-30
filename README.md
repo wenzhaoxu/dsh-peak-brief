@@ -1,5 +1,4 @@
-# 本项目代码部分全部由AI完成
-Jvavscpppt(doge)我不会，我只会C++
+
 
 # 关于上游「已被官方取代」的说法（已核实，2026-10-24）
 
@@ -104,6 +103,11 @@ dsh-peak-brief 已挂载（P6+谷期续跑）
 > 意图很直白：**让看门狗先于 V8 动手**。旧配置下看门狗阈值（1.2 GiB cgroup）
 > 只是略高于崩溃点（1.16 GiB），采样还隔 3 分钟——V8 在两次采样之间就死了。
 > 注意：改完要 `systemctl --user daemon-reload`（并重启 timer / dsh-web）才生效。
+
+
+# 本项目代码部分全部由AI完成
+Jvavscpppt(doge)我不会，我只会C++
+
 
 # dsh-peak-brief
 
