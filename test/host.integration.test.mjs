@@ -15,6 +15,14 @@ import { join } from 'node:path'
 
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 
+// 隔离相位事件落点：本文件 boot 的是真实 lib/index.js，tick 会触发
+// emitPhaseTransition 写 transitions.ndjson——不设这里就会污染生产信号文件
+// ~/.local/state/peak-brief/transitions.ndjson（2026-10-30 实测踩过）。
+process.env.PEAK_BRIEF_TRANSITIONS_PATH = join(
+  mkdtempSync(join(tmpdir(), 'pb-test-transitions-')),
+  'transitions.ndjson',
+)
+
 import { apply, name, inject } from '../lib/index.js'
 import { briefPathFor, writeBriefFile } from '../lib/brief-store.js'
 import { GATE_CODE } from '../lib/gate.js'

@@ -27,6 +27,8 @@ import * as plugin from '../lib/index.js'
 // 挂载会写进程存活标记；这组用例把 DSH_HOME 指到临时目录，不碰真实 ~/.dsh。
 const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-peak-real-'))
 process.env.DSH_HOME = TEST_HOME
+// 同上：隔离相位事件落点，不碰生产信号文件 ~/.local/state/peak-brief/transitions.ndjson。
+process.env.PEAK_BRIEF_TRANSITIONS_PATH = join(TEST_HOME, 'transitions.ndjson')
 process.on('exit', () => rmSync(TEST_HOME, { recursive: true, force: true }))
 
 /**
