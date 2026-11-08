@@ -101,13 +101,17 @@ test('只在 peak 相位拦截；lead / off / 节假日都不拦', () => {
   assert.equal(gate.decide(HOLIDAY, {}).reason, 'phase-off')
 })
 
-test('拦截文案说清原因与放行方式', () => {
+test('拦截文案说清原因、等多久、怎么放行', () => {
   const gate = makeGate()
   const message = gate.decide(PEAK, {}).message
   assert.match(message, /已拦截本次模型请求/)
-  assert.match(message, /高峰计价时段/)
+  // 用官方计费口径的"高峰时段"，不再用"高峰计价时段"这类半行话。
+  assert.match(message, /高峰时段/)
+  assert.match(message, /本段到 12:00 结束/, '被拦的人只关心还要等多久')
   assert.match(message, /不产生费用/)
   assert.match(message, /\/peak-allow 30/)
+  // 界面零枚举：给人看的文案里不许出现内部相位名。
+  assert.doesNotMatch(message, /(?<![/\w-])(off|lead|peak|hard|enabled)(?![\w-])/)
 })
 
 test('拦截 chunk 的形状符合 StreamChunk 协议', () => {

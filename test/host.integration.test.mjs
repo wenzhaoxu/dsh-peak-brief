@@ -196,7 +196,7 @@ test('插件契约与路由注册', () => {
   assert.equal((listeners.get('llm/stream') ?? []).length, 1)
   assert.equal((listeners.get('agent/request-error') ?? []).length, 1, 'P6：必须挂上官方重试正门')
   assert.equal(logs.length, 1)
-  assert.match(logs[0], /已挂载（P6\+谷期续跑）/)
+  assert.match(logs[0], /已加载（P6\+谷期续跑）/)
 })
 
 test('集成：普通工作日 08:50 进入 lead，09:00 进入 peak', async () => {
@@ -301,16 +301,18 @@ test('集成：非法配置在挂载时大声失败', () => {
   assert.throws(() => boot({ overrides: { '不是日期': 'off' } }), /YYYY-MM-DD/)
 })
 
-test('集成：挂载横幅带出真实相位与日历判定', async () => {
+test('集成：挂载横幅带出真实时段与日历判定', async () => {
   const { routes } = boot({})
   const res = await call(routes, '/api/peak-brief.state')
   const notice = res.json.state.notice
   assert.ok(notice, '挂载后应有一条提示')
   assert.equal(notice.kind, 'info')
-  assert.match(notice.text, /dsh-peak-brief 已挂载/)
-  assert.match(notice.text, /相位 (off|lead|peak)/)
-  assert.match(notice.text, /下次切换：/)
-  assert.match(notice.text, /门控：/)
+  assert.match(notice.text, /dsh-peak-brief 已加载/)
+  assert.match(notice.text, /现在：\d{4}-\d{2}-\d{2} \d{2}:\d{2}（.+）· (空闲时段|高峰前|高峰时段) —— /)
+  assert.match(notice.text, /拦截：(开|关)/)
+  assert.match(notice.text, /下次变化：/)
+  // 界面零枚举：横幅里不许出现内部相位名或配置键名（2026-11-08 用户看不懂「相位 off」）。
+  assert.doesNotMatch(notice.text, /(?<![/\w-])(off|lead|peak|hard|enabled)(?![\w-])/)
   assert.equal(res.json.state.phase, 'P6+谷期续跑')
   assert.equal(typeof res.json.state.build, 'string')
 })
@@ -321,7 +323,7 @@ test('集成：挂载横幅带出真实相位与日历判定', async () => {
  * 一条**快照**冒充**现状**。横幅会一直留到用户手动关，所以描述现状的行
  * 必须在读取时刻重算。
  */
-test('集成：挂载横幅里"当前/门控/下次切换"按读取时刻重算，不是挂载那一刻的死快照', async () => {
+test('集成：挂载横幅里"现在/拦截/下次变化"按读取时刻重算，不是挂载那一刻的死快照', async () => {
   const { routes } = boot({ enabled: true })
   const noticeAt = async (localIso) => {
     const res = await call(routes, `/api/peak-brief.state?at=${encodeURIComponent(`${localIso}+08:00`)}`)
@@ -338,25 +340,25 @@ test('集成：挂载横幅里"当前/门控/下次切换"按读取时刻重算�
   assert.equal(lead.at, peak.at)
   assert.equal(lead.live, 'mount', '只有挂载横幅需要按读取时刻重算')
 
-  // 正文必须跟着钟走
-  assert.match(lead.text, /当前：2026-09-17 08:55 · 工作日 · 相位 lead/)
-  assert.match(peak.text, /当前：2026-09-17 09:30 · 工作日 · 相位 peak/)
-  assert.match(off.text, /当前：2026-09-17 12:30 · 工作日 · 相位 off/)
+  // 正文必须跟着钟走：时段名 + 会不会拦，都是那一刻的判定
+  assert.match(lead.text, /现在：2026-09-17 08:55（工作日）· 高峰前 —— 09:00 起开始拦截/)
+  assert.match(peak.text, /现在：2026-09-17 09:30（工作日）· 高峰时段 —— 正在拦截（本段 12:00 结束）/)
+  assert.match(off.text, /现在：2026-09-17 12:30（工作日）· 空闲时段 —— 不会拦截/)
 
-  // 门控行说清"配置开着"与"此刻是否真在拦"两件事
-  assert.match(lead.text, /门控：硬拦已启用 · 当前相位不拦截/)
-  assert.match(peak.text, /门控：硬拦已启用 · 正在拦截/)
-  assert.match(off.text, /门控：硬拦已启用 · 当前相位不拦截/)
+  // 拦截行只说配置（开/关 + 时段），此刻拦不拦由上面那行负责
+  assert.match(lead.text, /拦截：开（工作日 09:00–12:00 \/ 14:00–18:00，提前 10 分钟准备）/)
+  assert.match(peak.text, /拦截：开（工作日 09:00–12:00 \/ 14:00–18:00，提前 10 分钟准备）/)
+  assert.match(off.text, /拦截：开（工作日 09:00–12:00 \/ 14:00–18:00，提前 10 分钟准备）/)
 
-  // 下次切换带时刻，同样随查询的瞬间变化
-  assert.match(lead.text, /下次切换：2026-09-17 09:00 → peak/)
-  assert.match(peak.text, /下次切换：2026-09-17 12:00 → off/)
-  assert.match(off.text, /下次切换：2026-09-17 13:50 → lead/)
+  // 下次变化说清"什么时候 + 会变成什么"，同样随查询的瞬间变化
+  assert.match(lead.text, /下次变化：今天 09:00 起开始拦截/)
+  assert.match(peak.text, /下次变化：今天 12:00 本段高峰结束/)
+  assert.match(off.text, /下次变化：今天 13:50 开始准备交接简报/)
 })
 
-test('集成：挂载横幅的"挂载于"是固定事实，与"当前"分开', async () => {
+test('集成：挂载横幅的"启动时刻"是固定事实，与"现在"分开', async () => {
   const { routes } = boot({ enabled: true })
-  const head = /^dsh-peak-brief 已挂载（P6\+谷期续跑）· 挂载于 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})$/
+  const head = /^dsh-peak-brief 已加载 · (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) 启动$/
   const first = (await call(routes, '/api/peak-brief.state')).json.state.notice
   const second = (await call(
     routes,
@@ -366,6 +368,42 @@ test('集成：挂载横幅的"挂载于"是固定事实，与"当前"分开', a
   assert.equal(first.at, second.at, '挂载时刻不随读取时间变化')
   assert.equal(first.text.split('\n')[0], second.text.split('\n')[0], '表头是历史事实，不跟着钟走')
   assert.notEqual(first.text, second.text, '但正文必须跟着钟走')
+})
+
+/**
+ * 用词守门：面向人的文字里不许出现内部枚举，也不许出现实现行话。
+ *
+ * 2026-11-08 用户原话：「看不懂这个信息」，指的是
+ * 「当前：2026-11-08 11:59 · 周末 · 相位 off」——中文行话 + 英文枚举。
+ * 这条用例把"横幅 + 状态命令 + 放行命令 + 拦截提示"四处文案一起钉住：
+ * 以后谁再往里塞一个 phase/门控/硬拦，立刻红。
+ */
+test('用词：所有面向人的输出都用时段说话——无枚举、无相位/门控/硬拦/挂载', async () => {
+  const commands = makeCommands()
+  const { routes, listeners } = boot(peakNow({ enabled: true }), { commands })
+  await call(routes, '/api/peak-brief.debug-clock', {
+    method: 'POST',
+    body: { at: `${TODAY}T10:00:00+08:00` },
+  })
+
+  // 顺序有讲究：拦截提示要在「放行」之前取，否则 5 分钟放行窗口会让请求直接通过。
+  const texts = [(await call(routes, '/api/peak-brief.state')).json.state.notice.text]
+  const run = await runStreamListener(listeners, { provider: 'p', model: 'm', messages: [] })
+  assert.equal(run.nextCalled, 0, '10:00 应当真的被拦')
+  texts.push(run.chunks[0].reason.failure.message)
+  texts.push((await commands.registered.get('peak-status').handler({})).text)
+  texts.push((await commands.registered.get('peak-allow').handler({ rawInput: '5' })).text)
+
+  for (const text of texts) {
+    // 枚举可以出现在路径/命令名里（/peak-allow、dsh-peak-brief），但不许当普通词用。
+    assert.doesNotMatch(text, /(?<![/\w-])(off|lead|peak|hard|enabled|popup|message)(?![\w-])/, text)
+    assert.doesNotMatch(text, /相位|门控|硬拦|挂载|提前量/, text)
+    assert.doesNotMatch(text, /\uFFFD/, text)
+  }
+  // 反过来：得说清"现在是哪一段"和"会不会拦"。
+  assert.match(texts[0], /空闲时段|高峰前|高峰时段/)
+  assert.match(texts[0], /不会拦截|正在拦截|起开始拦截/)
+  await call(routes, '/api/peak-brief.debug-clock', { method: 'POST', body: { at: null } })
 })
 
 test('集成：其他通知不被时钟重写——只有挂载横幅是 live', async () => {
@@ -429,7 +467,7 @@ test('集成：同一进程内重复挂载不会被误判成崩溃', async () =>
     const secondState = (await call(second.routes, '/api/peak-brief.state')).json.state
     assert.equal(secondState.notice.kind, 'info')
     assert.equal(secondState.restart, null)
-    assert.match(secondState.notice.text, /dsh-peak-brief 已挂载/)
+    assert.match(secondState.notice.text, /dsh-peak-brief 已加载/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -1372,11 +1410,13 @@ test('斜杠命令：/peak-status 汇总相位与门控', async () => {
   boot({ enabled: true, overrides: { [TODAY]: 'peak' }, peakWindows: [['00:00', '24:00']] }, { commands })
   const status = await commands.registered.get('peak-status').handler({})
   assert.equal(status.kind, 'success')
-  assert.match(status.text, /相位 peak/)
-  // 门控行与挂载横幅共用同一份文案：既说配置（硬拦已启用），也说此刻是否真在拦。
-  assert.match(status.text, /门控：硬拦已启用 · 正在拦截/)
-  // 时段配到 24:00 时，切换时刻必须落在次日 00:00，而不是写出"今天 00:00 → off"。
-  assert.match(status.text, /下次切换：\d{4}-\d{2}-\d{2} 00:00 → off/)
+  assert.match(status.text, /· 高峰时段 —— 正在拦截（本段 00:00 结束）/)
+  // 拦截行只说配置；"此刻在不在拦"由第一行负责（与挂载横幅共用同一份文案）。
+  assert.match(status.text, /拦截：开（工作日 00:00–24:00，提前 10 分钟准备）/)
+  // 时段配到 24:00 时，变化时刻必须落在次日 00:00，而不是写出"今天 00:00 → off"。
+  assert.match(status.text, /下次变化：明天 00:00 本段高峰结束/)
+  // 界面零枚举
+  assert.doesNotMatch(status.text, /(?<![/\w-])(off|lead|peak|hard|enabled)(?![\w-])/)
 })
 
 test('斜杠命令：/peak-brief 与 /peak-resume 驱动真实流程', async () => {

@@ -129,7 +129,7 @@ assert.equal(first.json.state.config.blockAuxiliary, true, '默认连辅助请�
 assert.ok(first.json.state.notice, '挂载后应当有一条待提示通知')
 const seq1 = first.json.state.notice.seq
 assert.equal(first.json.state.notice.kind, 'info')
-assert.match(first.json.state.notice.text, /门控：未启用/)
+assert.match(first.json.state.notice.text, /拦截：关（不会拦任何请求）/)
 
 // ---- 关闭当前那条 ----
 const dismissed = await call(routes, '/api/peak-brief.dismiss', { method: 'POST', body: { seq: seq1 } })

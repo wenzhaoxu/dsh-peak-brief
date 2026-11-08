@@ -27,6 +27,7 @@
     "scripts",
     "data",
     "test",
+    "docs",
     "cordis.patch.yml",
     "README.md"
   ],
