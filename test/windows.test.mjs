@@ -122,6 +122,24 @@ test('nextSwitchAt：一天之内的四次切换', () => {
   assert.equal(afterPeak.date, '2026-09-18')
 })
 
+test('describe.nextSwitch：切换到次日的时刻要写成次日，不许写成"今天 00:00"', () => {
+  // 时段配到 24:00（本仓测试与用户的"全天高峰"都用这种配法）：切换瞬间是次日 00:00。
+  // 2026-11-08 实测：describe() 曾沿用"这个切换点属于哪个峰谷日"，写出
+  // 「下次切换：2026-11-08 00:00 → off」——日期在白天、时刻却在午夜，自相矛盾。
+  const w = makeWindows({ peakWindows: [['00:00', '24:00']] })
+  const view = w.describe(bj('2026-09-17T10:00'))
+  assert.equal(view.phase, PHASE.PEAK)
+  assert.equal(view.nextSwitch.to, PHASE.OFF)
+  assert.equal(view.nextSwitch.date, '2026-09-18', '切换发生在次日 00:00')
+  assert.equal(view.nextSwitch.localTime, '00:00')
+  assert.equal(new Date(view.nextSwitch.at).toISOString(), new Date(bj('2026-09-18T00:00')).toISOString())
+
+  // 普通时段也不能把 date 弄坏：08:00 的下一次是同日 08:50。
+  const normal = makeWindows().describe(bj('2026-09-17T08:00'))
+  assert.equal(normal.nextSwitch.date, '2026-09-17')
+  assert.equal(normal.nextSwitch.localTime, '08:50')
+})
+
 test('跨周末：周五收盘后下一次是周一（跳过普通周末与调休上班日）', () => {
   const w = makeWindows()
   // 2026-09-18 周五 18:30；09-19 周六、09-20 周日（调休上班日）都不是峰谷日

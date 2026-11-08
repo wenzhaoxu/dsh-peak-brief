@@ -469,6 +469,10 @@ test('真实 SettingsForms：describe() 把 Config 投影成 9 个可编辑字�
         state: 2,
         runtime: { Config: plugin.Config },
         config: resolve({ leadMinutes: 12 }),
+        // settings.describe() 的生效值读 `fiber.effectiveConfig`（不是 `fiber.config`）。
+        // 2026-11-08 实测：DSH 侧改用 effectiveConfig 之后，这个假 fiber 少一个字段就让
+        // descriptor.value 变成 undefined、这条用例长期红着——而它正是"设置页会出现"的唯一证据。
+        effectiveConfig: resolve({ leadMinutes: 12 }),
         ctx,
         entry: { options: { id: 'peak-brief' } },
       },

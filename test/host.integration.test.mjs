@@ -315,6 +315,80 @@ test('集成：挂载横幅带出真实相位与日历判定', async () => {
   assert.equal(typeof res.json.state.build, 'string')
 })
 
+/**
+ * 2026-11-08 实测事故：横幅 11:59 挂载时把"当前：…"拼成固定文本推出去，
+ * 15:13 屏幕上仍写着「当前：2026-11-08 11:59 · 周末 · 相位 off」——
+ * 一条**快照**冒充**现状**。横幅会一直留到用户手动关，所以描述现状的行
+ * 必须在读取时刻重算。
+ */
+test('集成：挂载横幅里"当前/门控/下次切换"按读取时刻重算，不是挂载那一刻的死快照', async () => {
+  const { routes } = boot({ enabled: true })
+  const noticeAt = async (localIso) => {
+    const res = await call(routes, `/api/peak-brief.state?at=${encodeURIComponent(`${localIso}+08:00`)}`)
+    assert.equal(res.status, 200, `查询 ${localIso} 失败`)
+    return res.json.state.notice
+  }
+
+  const lead = await noticeAt('2026-09-17T08:55:00')
+  const peak = await noticeAt('2026-09-17T09:30:00')
+  const off = await noticeAt('2026-09-17T12:30:00')
+
+  // 同一个事件：seq 与 at 不变（客户端靠 seq 才关得掉这条横幅）
+  assert.equal(lead.seq, peak.seq)
+  assert.equal(lead.at, peak.at)
+  assert.equal(lead.live, 'mount', '只有挂载横幅需要按读取时刻重算')
+
+  // 正文必须跟着钟走
+  assert.match(lead.text, /当前：2026-09-17 08:55 · 工作日 · 相位 lead/)
+  assert.match(peak.text, /当前：2026-09-17 09:30 · 工作日 · 相位 peak/)
+  assert.match(off.text, /当前：2026-09-17 12:30 · 工作日 · 相位 off/)
+
+  // 门控行说清"配置开着"与"此刻是否真在拦"两件事
+  assert.match(lead.text, /门控：硬拦已启用 · 当前相位不拦截/)
+  assert.match(peak.text, /门控：硬拦已启用 · 正在拦截/)
+  assert.match(off.text, /门控：硬拦已启用 · 当前相位不拦截/)
+
+  // 下次切换带时刻，同样随查询的瞬间变化
+  assert.match(lead.text, /下次切换：2026-09-17 09:00 → peak/)
+  assert.match(peak.text, /下次切换：2026-09-17 12:00 → off/)
+  assert.match(off.text, /下次切换：2026-09-17 13:50 → lead/)
+})
+
+test('集成：挂载横幅的"挂载于"是固定事实，与"当前"分开', async () => {
+  const { routes } = boot({ enabled: true })
+  const head = /^dsh-peak-brief 已挂载（P6\+谷期续跑）· 挂载于 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})$/
+  const first = (await call(routes, '/api/peak-brief.state')).json.state.notice
+  const second = (await call(
+    routes,
+    `/api/peak-brief.state?at=${encodeURIComponent('2026-09-17T09:30:00+08:00')}`,
+  )).json.state.notice
+  assert.match(first.text.split('\n')[0], head)
+  assert.equal(first.at, second.at, '挂载时刻不随读取时间变化')
+  assert.equal(first.text.split('\n')[0], second.text.split('\n')[0], '表头是历史事实，不跟着钟走')
+  assert.notEqual(first.text, second.text, '但正文必须跟着钟走')
+})
+
+test('集成：其他通知不被时钟重写——只有挂载横幅是 live', async () => {
+  const { routes } = boot(peakNow({ enabled: true }))
+  await call(routes, '/api/peak-brief.debug-clock', {
+    method: 'POST',
+    body: { at: `${TODAY}T10:00:00+08:00` },
+  })
+  // 放行会推一条新通知，顶掉挂载横幅：这条记录的是"当时放行了"这个既成事实。
+  const allowed = await call(routes, '/api/peak-brief.allow', { method: 'POST', body: { minutes: 15 } })
+  const notice = (await call(routes, '/api/peak-brief.state')).json.state.notice
+  assert.equal(notice.seq, allowed.json.state.notice.seq)
+  assert.notEqual(notice.live, 'mount')
+  assert.match(notice.text, /已放行本次高峰/)
+
+  const later = (await call(
+    routes,
+    `/api/peak-brief.state?at=${encodeURIComponent('2026-09-17T09:30:00+08:00')}`,
+  )).json.state.notice
+  assert.equal(later.text, notice.text, '既成事实不随查询瞬间改写')
+  await call(routes, '/api/peak-brief.debug-clock', { method: 'POST', body: { at: null } })
+})
+
 /** 一个**确定已经退出**的 pid：起一个空进程并等它结束。 */
 function deadPid() {
   const child = spawnSync(process.execPath, ['-e', ''], { timeout: 20000 })
@@ -1299,7 +1373,10 @@ test('斜杠命令：/peak-status 汇总相位与门控', async () => {
   const status = await commands.registered.get('peak-status').handler({})
   assert.equal(status.kind, 'success')
   assert.match(status.text, /相位 peak/)
-  assert.match(status.text, /门控：正在硬拦/)
+  // 门控行与挂载横幅共用同一份文案：既说配置（硬拦已启用），也说此刻是否真在拦。
+  assert.match(status.text, /门控：硬拦已启用 · 正在拦截/)
+  // 时段配到 24:00 时，切换时刻必须落在次日 00:00，而不是写出"今天 00:00 → off"。
+  assert.match(status.text, /下次切换：\d{4}-\d{2}-\d{2} 00:00 → off/)
 })
 
 test('斜杠命令：/peak-brief 与 /peak-resume 驱动真实流程', async () => {
